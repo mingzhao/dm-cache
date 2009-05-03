@@ -1,0 +1,135 @@
+dm-cache - cache target for device-mapper
+==============================
+
+dm-cache version 0.1 by
+  Ming Zhao, mingzhao99th@gmail.com
+
+
+Contents
+===========
+* Introduction
+* Requirements
+* Installation
+* Setup
+* Further information
+
+
+Introduction
+==============
+
+  Dm-cache is a generic block-level disk cache for storage networking. It is
+  built upon the Linux device-mapper, a generic block device virtualization
+  infrastructure. It can be transparently plugged into a client of any storage
+  system, including SAN, iSCSI and AoE, and supports dynamic customization for
+  policy-guided optimizations.
+
+  It is based on the research I conducted as a summer intern at IBM Research
+  Austin Lab., under the guidance of my mentor Eric Van Hensbergen.
+
+
+Requirements
+===============
+
+  Dm-cache relies on the device-mapper kernel module (dm_mod.ko), which is
+  available in the recent kernel versions. For older kernels, please refer to
+  http://sources.redhat.com/dm/patches.html for device-mapper patches.
+
+  In addition to dm-cache, device mapper also has other targets, including the
+  popular Logical Volume Manager (LVM), but those are not necessary for the use
+  of dm-cache.
+
+  To set up dm-cache, you also need the device-mapper userspace library, which
+  is available in your Linux distribution. For debian family, it is the dmsetup
+  package; for Fedora Core and SUSE, it is the device-mapper package.
+
+
+Installation
+==============
+
+* Download dm-cache:
+  The latest dm-cache kernel patch can be found at: 
+  www.acis.ufl.edu/~ming/dmcache
+  It is also available in Eric's repository on kernel.org:
+  /pub/scm/linux/kernel/git/ericvh/devel.git
+
+* Patch your kernel:
+  Enter your kernel source's directory, and run:
+
+  patch -p1 < path_to_the_patch
+
+* Reconfigure kernel:
+  Enable CONFIG_DM, and CONFIG_DM_CACHE.
+  If you use GUI to configure kernel, enable "Device mapper support" and
+  "Cache target support", under "Device Drivers->Multipe-device support (RAID
+  and LVM)".
+
+* Rebuild your kernel modules:
+
+	make modules_install
+
+
+Setup
+========
+
+* Load dm_mod and dm_cache modules:
+
+  modprobe dm_mod
+  modprobe dm_cache
+
+
+* Use dmsetup to create a cache:
+
+  Suppose the data you want to use is stored on /dev/sdc, e.g. a disk remotely 
+  attached via iSCSI, and the local disk you want to use for caching the data 
+  is /dev/sdb. Then issue a command in the following format to create a cache:
+
+  echo 0 131072 cache /dev/sdc /dev/sdb 0 8 65536 256 1 | dmsetup create foo
+
+  The first and second arguments after the "echo" command are the starting and 
+  ending offsets of your source device (/dev/sdc). The third argument is always
+  "cache", which is the name of the dm-cache target. The fourth and fifth 
+  arguments are the paths to your source and cache device, respectively. The 
+  rest of the arguments are the parameters for configuring your cache. If you do
+  not specify these parameters, the default ones will be used.
+
+  The first one is a flag to tell dm-cache whether to load cache metadata from
+  the cache device. If it is set, the previously used cache configuration as
+  well as the existing cached data are reused. Therefore you do not need to
+  specify other parameters. Otherwise, a new cache is started from scratch.
+
+  The second and third parameters specify the block size used by the cache (in
+  number of sectors), and the capacity of the cache (in number of blocks). The
+  fourth parameter specifies the cache associativity.
+
+  The fifth parameter tells dm-cache whether to enable write back. If it is set,
+  then writes are buffered in cache first, and committed to the source device
+  later (before the cache is removed). Therefore, the performance of write
+  operations can be improved. But it is not recommended if your cache device is
+  not stable, which may cause data loss if it crashes.
+
+  If the command succeeds, a virtual device with the given name ("foo") is
+  created under /dev/mapper. You can mount it as a regular device, and it
+  automatically caches the data blocks accessed from the source device.
+
+  If it fails, please check /var/log/kern.log for detailed error information.
+
+
+* Use a dmc-setup.pl to create a cache:
+
+  Dmc-setup.pl is a helper program for managing disk caches. It is available at
+  www.acis.ufl.edu/~ming/dmcache.
+
+
+* Remove a cache:
+
+  Suppose your cache is named "foo", run commands:
+
+  umount /dev/mapper/foo
+  dmsetup remove acache
+
+
+Further information
+=====================
+
+  Dm-cache Homepage: http://www.acis.ufl.edu/~ming/dmcache
+  Device-mapper Resource Page: http://sources.redhat.com/dm
