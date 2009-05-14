@@ -5,6 +5,7 @@ dm-cache version 0.1 by
   Ming Zhao, mingzhao99th@gmail.com
 
 
+
 Contents
 ===========
 * Introduction
@@ -12,6 +13,7 @@ Contents
 * Installation
 * Setup
 * Further information
+
 
 
 Introduction
@@ -23,8 +25,6 @@ Introduction
   system, including SAN, iSCSI and AoE, and supports dynamic customization for
   policy-guided optimizations.
 
-  It is based on the research I conducted as a summer intern at IBM Research
-  Austin Lab., under the guidance of my mentor Eric Van Hensbergen.
 
 
 Requirements
@@ -43,14 +43,14 @@ Requirements
   package; for Fedora Core and SUSE, it is the device-mapper package.
 
 
+
 Installation
 ==============
 
 * Download dm-cache:
   The latest dm-cache kernel patch can be found at: 
-  www.acis.ufl.edu/~ming/dmcache
-  It is also available in Eric's repository on kernel.org:
-  /pub/scm/linux/kernel/git/ericvh/devel.git
+  http://github.com/mingzhao/dm-cache
+  git://github.com/mingzhao/dm-cache.git
 
 * Patch your kernel:
   Enter your kernel source's directory, and run:
@@ -66,6 +66,7 @@ Installation
 * Rebuild your kernel modules:
 
 	make modules_install
+
 
 
 Setup
@@ -113,16 +114,18 @@ Setup
 
   If it fails, please check /var/log/kern.log for detailed error information.
 
+  Tip: You can find out your device's (e.g., /dev/sdc) using the following
+  command: blockdev --getsize /dev/sdc
 
 * Use a dmc-setup.pl to create a cache:
 
-  Dmc-setup.pl is a helper program for managing disk caches. It is available at
-  www.acis.ufl.edu/~ming/dmcache.
+  Dmc-setup.pl is a helper program for managing disk caches. Your can perldoc
+  for its help information: perldoc dmc-setup.pl
 
 
 * Remove a cache:
 
-  Suppose your cache is named "foo", run commands:
+  Assuming your cache is named "foo", run commands:
 
   umount /dev/mapper/foo
   dmsetup remove acache
@@ -131,5 +134,6 @@ Setup
 Further information
 =====================
 
-  Dm-cache Homepage: http://www.acis.ufl.edu/~ming/dmcache
+  Dm-cache at Ming's homepage: http://www.cis.fiu.edu/~zhaom/dmcache
+  Dm-cache at github: http://github.com/mingzhao/dm-cache
   Device-mapper Resource Page: http://sources.redhat.com/dm
