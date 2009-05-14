@@ -4,10 +4,11 @@
  *
  *  Copyright (C) International Business Machines Corp., 2006
  *  Copyright (C) Ming Zhao, Florida International University, 2008-2009
- *  Author: Ming Zhao (mingzhao@ufl.edu)
+ *
+ *  Author: Ming Zhao (mingzhao99th@gmail.com)
  *  Contributors:
  *    Eric Van Hensbergen (metoring of this intern project at IBM in 2006)
- *    Reng Zeng (code update for 2.6.27-kenrel as part of his COP6611 course 
+ *    Reng Zeng (code update for 2.6.27-kenrel as part of his COP6611 course
  *    project at FIU in 2008)
  *
  *  This program is free software; you can redistribute it and/or modify
