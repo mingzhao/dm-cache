@@ -5,10 +5,10 @@
  *  Copyright (C) International Business Machines Corp., 2006
  *  Copyright (C) Ming Zhao, Florida International University, 2007-2009
  *
- *  Authors: Ming Zhao (dm-cache@googlegroups.com)
- *  Contributors:
- *    Eric Van Hensbergen, Reng Zeng, Stephen Bromfield, Douglas Otstott,
- *    Dulcardo Clavijo
+ *  Authors: Ming Zhao, Stephen Bromfield, Douglas Otstott,
+ *    Dulcardo Clavijo (dm-cache@googlegroups.com)
+ *  Other contributors:
+ *    Eric Van Hensbergen, Reng Zeng 
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
