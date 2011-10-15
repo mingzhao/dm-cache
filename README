@@ -2,7 +2,7 @@ dm-cache - cache target for device-mapper
 ==============================
 
 dm-cache version 0.1 by
-  Ming Zhao, mingzhao99th@gmail.com
+  Ming Zhao, dm-cache@googlegroups.com
 
 
 
@@ -134,6 +134,6 @@ Setup
 Further information
 =====================
 
-  Dm-cache at Ming's homepage: http://www.cis.fiu.edu/~zhaom/dmcache
+  Dm-cache's discussion group: http://groups.google.com/group/dm-cache
   Dm-cache at github: http://github.com/mingzhao/dm-cache
   Device-mapper Resource Page: http://sources.redhat.com/dm
