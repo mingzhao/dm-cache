@@ -1282,7 +1282,8 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
 		bio->bi_bdev = dmc->src_dev->bdev;	//	return 1;
 		return cache_write_cache(dmc, bio,cache_block,0,1);
-}
+	}
+
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
 	request_block = bio->bi_sector - offset;
 
