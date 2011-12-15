@@ -148,6 +148,8 @@ int     dm_dev_identifier = 0;
 struct  dm_dev dev_arr[8];
 
 static int cache_read_hit(struct cache_c *dmc, struct bio* bio,sector_t cache_block);
+static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
+				int hit, int writethrough);
 
 
 /****************************************************************************
@@ -304,8 +306,6 @@ static void free_bio_pages(struct cache_c *dmc)
 static struct workqueue_struct *_kcached_wq;
 static struct work_struct _kcached_work;
 
-static struct workqueue_struct *_scached_wq;
-static struct work_struct _scached_work;
 
 static inline void wake(void)
 {
@@ -1081,7 +1081,8 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		if (dmc->write_policy == WRITE_THROUGH) { /* Invalidate cached data */
 			cache_invalidate(dmc, cache_block);
 			bio->bi_bdev = dmc->src_dev->bdev;
-			return 1;
+			return cache_write_cache(dmc, bio,cache_block,1,1);
+			//return 1;
 		}
 
 		/* Write delay */
@@ -1119,6 +1120,7 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		bio->bi_sector = (cache_block << dmc->block_shift) + offset;
 
 		spin_unlock(&cache[cache_block].lock);
+		return cache_write_cache(dmc, bio,cache_block,1,0);
 		return 1;
 	}
 }
@@ -1278,15 +1280,11 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 	sector_t request_block, left;
 
 	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
-		bio->bi_bdev = dmc->src_dev->bdev;
-		return 1;
-	}
-
+		bio->bi_bdev = dmc->src_dev->bdev;	//	return 1;
+		return cache_write_cache(dmc, bio,cache_block,0,1);
+}
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
 	request_block = bio->bi_sector - offset;
-
-	while (cache[cache_block].state & RESERVED)
-		;
 
 	if (cache[cache_block].state & VALID) {
 		DPRINTK("Replacing %llu->%llu",
@@ -1334,6 +1332,82 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 	return 0;
 }
 
+/*
+ * Handle a write cache hit:
+ */
+static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
+				int hit, int writethrough) {
+	struct cacheblock *cache = dmc->cache;
+	unsigned int offset, head, tail;
+	struct kcached_job *job;
+	sector_t request_block, left;
+
+
+	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
+	request_block = bio->bi_sector - offset;
+
+	if (cache[cache_block].state & VALID) {
+		DPRINTK("WRITE THROUGH MISS .VALID  %llu->%llu",
+		        cache[cache_block].block, request_block);
+		dmc->replace++;
+	} else DPRINTK("WRITE THROUG MISS INVALID request: %llu cache block %llu",
+		request_block, cache_block);
+
+	/* Write delay */
+	//cache_insert(dmc, request_block, cache_block); /* Update metadata first */
+	//set_state(cache[cache_block].state, DIRTY);
+	//dmc->dirty_blocks++;
+//------------job-------------------------
+//	job = new_kcached_job(dmc, bio, request_block, cache_block);
+
+	struct dm_io_region dest;
+	if(writethrough)
+		dest.bdev = dmc->src_dev->bdev;
+	else
+		dest.bdev = dmc->cache_dev->bdev;
+
+	dest.sector = bio->bi_sector;
+
+	dest.count = dmc->block_size;
+	job = mempool_alloc(_job_pool, GFP_NOIO);
+	job->dmc = dmc;
+	job->bio = bio;
+	job->dest = dest;
+	job->cacheblock = &dmc->cache[cache_block];
+	job->hit = hit ;
+
+//----------------------------------------------
+	head = to_bytes(offset);
+	left = (dmc->src_dev->bdev->bd_inode->i_size>>9) - request_block;
+	if (left < dmc->block_size) {
+		tail = to_bytes(left) - bio->bi_size - head;
+		job->src.count = left;
+		job->dest.count = left;
+	} else
+		tail = to_bytes(dmc->block_size) - bio->bi_size - head;
+
+	if (0 == head && 0 == tail) { /* Requested is aligned with a cache block */
+		job->nr_pages = 0;
+		job->rw = WRITE;
+	} else if (head && tail){ /* Special case: need to pad both head and tail */
+		job->nr_pages = dm_div_up(to_bytes(job->src.count), PAGE_SIZE);
+		job->rw = READ;
+	} else {
+		if (head) { /* Fetch only head */
+			job->src.count = to_sector(head);
+			job->nr_pages = dm_div_up(head, PAGE_SIZE);
+		} else { /* Fetch only tail */
+			job->src.sector = bio->bi_sector + to_sector(bio->bi_size);
+			job->src.count = to_sector(tail);
+			job->nr_pages = dm_div_up(tail, PAGE_SIZE);
+		}
+		job->rw = READ;
+	}
+	queue_job(job);
+
+	return 0;
+}
+
 /* Handle cache misses */
 static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block) {
 	if (bio_data_dir(bio) == READ)
@@ -1363,7 +1437,7 @@ static int cache_map_bio(struct dm_target *ti, struct bio *bio)
 {
 	struct cache_c *dmc = (struct cache_c *) ti->private;
 	sector_t request_block, cache_block = 0, offset;
-	int res;
+	int res, disk;
 
 	offset = bio->bi_sector & dmc->block_mask;
 	request_block = bio->bi_sector - offset;
@@ -1375,15 +1449,15 @@ static int cache_map_bio(struct dm_target *ti, struct bio *bio)
 	if (bio->bi_size > 4096){
 		DPRINTK("BIO HUGE!!!!!!!!!!");
 	}
-	DPRINTK("BIO: %llu",bio->bi_bdev->bd_dev);
-	DPRINTK("SOURCE: %llu",dmc->src_dev->bdev->bd_dev);
-	DPRINTK("CACHE: %llu",dmc->cache_dev->bdev->bd_dev);
+	DPRINTK("BIO: %llu",(long long unsigned int)bio->bi_bdev->bd_dev);
+	DPRINTK("SOURCE: %llu",(long long unsigned int)dmc->src_dev->bdev->bd_dev);
+	DPRINTK("CACHE: %llu", (long long unsigned int)dmc->cache_dev->bdev->bd_dev);
 	DPRINTK("Counter_map: %d",++counter_map);
 
 	if (bio_data_dir(bio) == READ) dmc->reads++;
 	else dmc->writes++;
 	
-	int disk = get_disk_identifier(dmc);
+	disk = get_disk_identifier(dmc);
 
 	res = cache_lookup(dmc, request_block, &cache_block,disk);
 	if (1 == res)  /* Cache hit; server request from cache */
@@ -1438,7 +1512,7 @@ static int load_metadata(struct cache_c *dmc) {
 	dm_io_sync_vm(1, &where, READ, meta_dmc, &bits, dmc);
 	DPRINTK("Loaded cache conf: block size(%u), cache size(%llu), " \
 	        "associativity(%u), write policy(%u), chksum(%u)",
-	        meta_dmc->block_size, meta_dmc->size,
+	        (unsigned int) meta_dmc->block_size,(long long unsigned int) meta_dmc->size,
 	        meta_dmc->assoc, meta_dmc->write_policy,
 	        meta_dmc->chksum);
 
