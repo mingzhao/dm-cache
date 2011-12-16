@@ -1,0 +1,60 @@
+*** dm-cache.c.orig	2011-11-24 21:22:21.000000000 +0100
+--- dm-cache.c	2011-11-24 21:22:24.000000000 +0100
+***************
+*** 894,900 ****
+   *
+   */
+  static int cache_lookup(struct cache_c *dmc, sector_t block,
+! 	                    sector_t *cache_block)
+  {
+  	unsigned long set_number = hash_block(dmc, block);
+  	sector_t index;
+--- 894,900 ----
+   *
+   */
+  static int cache_lookup(struct cache_c *dmc, sector_t block,
+! 	                    sector_t *cache_block, int noalloc)
+  {
+  	unsigned long set_number = hash_block(dmc, block);
+  	sector_t index;
+***************
+*** 937,942 ****
+--- 937,943 ----
+  
+  	res = i < cache_assoc ? 1 : 0;
+  	if (!res) { /* Cache miss */
++ 		if (noalloc == 1) return res;
+  		if (invalid != -1) /* Choose the first empty frame */
+  			*cache_block = set_number * cache_assoc + invalid;
+  		else if (oldest_clean != -1) /* Choose the LRU clean block to replace */
+***************
+*** 1231,1236 ****
+--- 1232,1238 ----
+  	struct cache_c *dmc = (struct cache_c *) ti->private;
+  	sector_t request_block, cache_block = 0, offset;
+  	int res;
++ 	int noalloc = 0;
+  
+  	offset = bio->bi_sector & dmc->block_mask;
+  	request_block = bio->bi_sector - offset;
+***************
+*** 1243,1249 ****
+  	if (bio_data_dir(bio) == READ) dmc->reads++;
+  	else dmc->writes++;
+  
+! 	res = cache_lookup(dmc, request_block, &cache_block);
+  	if (1 == res)  /* Cache hit; server request from cache */
+  		return cache_hit(dmc, bio, cache_block);
+  	else if (0 == res) /* Cache miss; replacement block is found */
+--- 1245,1255 ----
+  	if (bio_data_dir(bio) == READ) dmc->reads++;
+  	else dmc->writes++;
+  
+! 	/* WRITE_THROUGH does not need a cache_block */
+! 	if (dmc->write_policy == WRITE_THROUGH && bio_rw(bio) == WRITE)
+! 		noalloc = 1;
+! 
+! 	res = cache_lookup(dmc, request_block, &cache_block, noalloc);
+  	if (1 == res)  /* Cache hit; server request from cache */
+  		return cache_hit(dmc, bio, cache_block);
+  	else if (0 == res) /* Cache miss; replacement block is found */
