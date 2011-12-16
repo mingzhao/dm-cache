@@ -1,0 +1,56 @@
+#!/bin/bash
+
+function create {
+
+insmod dm-cache.ko
+
+echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node2-disk  /dev/sdc 0 8 131072 1024 0 | dmsetup create cache2
+echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node3-disk  /dev/sdc 0 8 131072 1024 0 | dmsetup create cache3
+}
+
+function create2 {
+
+insmod dm-cache.ko
+
+echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node2-disk  /dev/sdc 0 8 131072 1 0 | dmsetup create cache2
+}
+
+
+function mounting {
+mount /dev/mapper/cache2 /mnt/cache2
+mount /dev/mapper/cache3 /mnt/cache3
+
+mount
+
+}
+function start_cache {
+	create
+	mounting
+}
+function destroy {
+	umount /mnt/cache2
+	umount /mnt/cache3
+
+	dmsetup remove cache2	
+	dmsetup remove cache3	
+	rmmod dm_cache
+}
+
+case "$1" in
+
+	start)
+		start_cache
+		;;
+	create)
+		create
+		;;
+	destroy)
+		destroy
+		;;
+	cache2)
+		create2
+		;;
+	*)
+		echo "$0 create/destroy"
+		;;
+esac
