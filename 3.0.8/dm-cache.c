@@ -79,6 +79,10 @@ int    bio_in_progress = 0;
 #define WRITEBACK	8	/* In the process of write back */
 #define WRITETHROUGH	16	/* In the process of write back */
 
+#define READY           0
+#define PENDING_WRITE   1
+#define PENDING_READ    2
+
 #define is_state(x, y)		(x & y)
 #define set_state(x, y)		(x |= y)
 #define clear_state(x, y)	(x &= ~y)
@@ -125,6 +129,7 @@ struct cacheblock {
 	spinlock_t lock;	/* Lock to protect operations on the bio list */
 	sector_t block;		/* Sector number of the cached block */
 	unsigned short state;	/* State of a block */
+	unsigned short status; 
 	unsigned long counter;	/* Logical timestamp of the block's last access */
 	struct bio_list bios;	/* List of pending bios */
 };
@@ -138,6 +143,7 @@ struct kcached_job {
 	struct dm_io_region dest;
 	struct cacheblock *cacheblock;
 	int rw;
+	int hit;
 	/*
 	 * When the original bio is not aligned with cache blocks,
 	 * we need extra bvecs and pages for padding.
@@ -148,9 +154,12 @@ struct kcached_job {
 };
 
 
-int do_complete(struct kcached_job *job);
-int do_io(struct kcached_job *job);
 static int cache_insert(struct cache_c *dmc, sector_t block,sector_t cache_block); 
+static int cache_read_hit(struct cache_c *dmc, struct bio* bio,sector_t cache_block);
+static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
+                                int hit, int writethrough);
+
+
 /****************************************************************************
  *  Wrapper functions for using the new dm_io API
  ****************************************************************************/
@@ -396,26 +405,26 @@ static inline void push(struct list_head *jobs, struct kcached_job *job)
  * the requested data from the results.
  ****************************************************************************/
 
+
 static void io_callback(unsigned long error, void *context)
 {
-	struct kcached_job *job = (struct kcached_job *) context;
+        struct kcached_job *job = (struct kcached_job *) context;
 
-	if (error) {
-		/* TODO */
-		DMERR("io_callback: io error");
-		return;
-	}
-
-	if (job->rw == READ) {
-		job->rw = WRITE;
-		//do_io(job);
-		push(&_io_jobs, job);
-	} else {
-		do_complete(job);
-	//	push(&_complete_jobs, job);
-	}
-	wake();
+	DPRINTK("IOCALLBACK!!!!");
+        if (error) {
+                /* TODO */
+                DMERR("io_callback: io error");
+                return;
+        }
+        //just push a write if its a READ and MISS
+        if (job->rw == READ && job->hit !=1) {
+                job->rw = WRITE;
+                push(&_io_jobs, job);
+        } else
+                push(&_complete_jobs, job);
+        wake();
 }
+
 
 /*
  * Fetch data from the source device asynchronously.
@@ -730,36 +739,48 @@ static void flush_bios(struct cacheblock *cacheblock)
 	}
 }
 
-int do_complete(struct kcached_job *job)
+static int do_complete(struct kcached_job *job)
 {
-	int i, r = 0;
-	struct bio *bio = job->bio;
+        int i, r = 0;
+        struct bio *bio = job->bio;
 
-	DPRINTK("do_complete: %llu", bio->bi_sector);
+        DPRINTK("do_complete: %llu", bio->bi_sector);
 
-	if (bio_data_dir(bio) == READ) {
-		for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
-			put_page(bio->bi_io_vec[i].bv_page);
-		}
-		bio_put(bio);
-	} else
-		bio_endio(bio, 0);
+        if(bio_data_dir(bio) == READ && job->hit == 1 ){
+                for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
+                        get_page(bio->bi_io_vec[i].bv_page);
+                }
+                bio_endio(bio,0);
+        }
 
-	if (job->nr_pages > 0) {
-		kfree(job->bvec);
-		kcached_put_pages(job->dmc, job->pages);
-	}
+        if (bio_data_dir(bio) == READ) {
+                for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
+                        put_page(bio->bi_io_vec[i].bv_page);
+                }
+                if(job->hit != 1 )
+                        bio_put(bio);
+        } else
+                bio_endio(bio, 0);
+        if (job->nr_pages > 0) {
+                kfree(job->bvec);
+                kcached_put_pages(job->dmc, job->pages);
+        }
 
-	flush_bios(job->cacheblock);
-	mempool_free(job, _job_pool);
+        if(job->hit != 1 )
+                flush_bios(job->cacheblock);
 
-	if (atomic_dec_and_test(&job->dmc->nr_jobs))
-		wake_up(&job->dmc->destroyq);
+
+        job->cacheblock->status = READY;
+
+        mempool_free(job, _job_pool);
+
+        if (atomic_dec_and_test(&job->dmc->nr_jobs))
+                wake_up(&job->dmc->destroyq);
 
         bio_in_progress = 0;
-//	spin_unlock_irqrestore(&bio_lock, bio_flags);  
-	return r;
+        return r;
 }
+
 
 /*
  * Run through a list for as long as possible.  Returns the count
@@ -796,7 +817,7 @@ static int process_jobs(struct list_head *jobs,
 
 static void do_work(struct work_struct *ignored)
 {
-	//process_jobs(&_complete_jobs, do_complete);
+	process_jobs(&_complete_jobs, do_complete);
 	process_jobs(&_pages_jobs, do_pages);
 	process_jobs(&_io_jobs, do_io);
 }
@@ -1093,19 +1114,21 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 
 	if (bio_data_dir(bio) == READ) { /* READ hit */
 		bio->bi_bdev = dmc->cache_dev->bdev;
-		//bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
-		//bio->bi_sector = cache_block ;
+		bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
+		bio->bi_sector = cache_block ;
+	
+     return cache_read_hit(dmc,bio,cache_block);
 
-		spin_lock(&cache[cache_block].lock);
+/*		spin_lock(&cache[cache_block].lock);
 
-		if (is_state(cache[cache_block].state, VALID)) { /* Valid cache block */
+		if (is_state(cache[cache_block].state, VALID)) { // Valid cache block 
 			spin_unlock(&cache[cache_block].lock);
 			
 			DPRINTK("VALID!!! %llu:%llu",cache_block,bio->bi_sector);
 			return 1;
 		}
 
-		/* Cache block is not ready yet */
+		// Cache block is not ready yet 
 		DPRINTK("Add to bio list %s(%llu)",
 				dmc->cache_dev->name, bio->bi_sector);
 		bio_list_add(&cache[cache_block].bios, bio);
@@ -1113,14 +1136,15 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		spin_unlock(&cache[cache_block].lock);
 		DPRINTK("Add1 to bio list %s(%llu)",
 				dmc->cache_dev->name, bio->bi_sector);
-		return 0;
+		return 0;*/
 	} else { /* WRITE hit */
 		if (dmc->write_policy == WRITE_THROUGH) { /* Invalidate cached data */
 			if (is_state(cache[cache_block].state, VALID)) {
 				DPRINTK("WRITE THROUGH VALID!!!");
 				cache_invalidate(dmc, cache_block);
 				bio->bi_bdev = dmc->src_dev->bdev;
-				return 1;
+				return cache_write_cache(dmc, bio,cache_block,1,1);
+//				return 1;
 			}
 			
 				DPRINTK("WRITE THROUGH INVALID!!!");
@@ -1165,7 +1189,7 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		bio->bi_sector = (cache_block << dmc->block_shift) + offset;
 
 		spin_unlock(&cache[cache_block].lock);
-		return 1;
+		return cache_write_cache(dmc, bio,cache_block,1,0);
 	}
 }
 
@@ -1237,6 +1261,7 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 	else /* Need new pages to store extra data */
 		job->nr_pages = dm_div_up(head, PAGE_SIZE) + dm_div_up(tail, PAGE_SIZE);
 	job->rw = READ; /* Fetch data from the source device */
+	job->hit = 0;
 
 	BUG_ON(job->nr_pages != 0); // should be aligned
 	DPRINTK("Queue job for %llu (need %u pages)",
@@ -1247,54 +1272,156 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 
 	return 0;
 }
-
-
+/*
+ * Handle a read cache hit:
+ *  fetch the necessary block from cache device;
+ *  restore, do not do store, just jumpt directly to do_complete
+ *  
+ */
 static int cache_read_hit(struct cache_c *dmc, struct bio* bio,
-	                       sector_t cache_block) {
-	struct cacheblock *cache = dmc->cache;
-	unsigned int offset, head, tail;
-	struct kcached_job *job;
-	sector_t request_block, left;
+                               sector_t cache_block) {
+        DPRINTK("CACHE_READ_HIT!!!!");
+        struct cacheblock *cache = dmc->cache;
+        unsigned int offset, head, tail;
+        struct kcached_job *job;
+        sector_t request_block, left;
 
-	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
-	request_block = bio->bi_sector - offset;
+        offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
+        request_block = bio->bi_sector - offset;
 
-	if (cache[cache_block].state & VALID) {
-		DPRINTK("Replacing %llu->%llu",
-		        cache[cache_block].block, request_block);
-		dmc->replace++;
-	} else DPRINTK("Insert block %llu at empty frame %llu",
-		request_block, cache_block);
+        if (cache[cache_block].state & VALID) {
+                DPRINTK("Hit Read been processed %llu->%llu",
+                        cache[cache_block].block, request_block);
+        } else{
+                DPRINTK("Something is wrong here %llu at empty frame %llu",
+                request_block, cache_block);
+        //      BUG_ON(1);
+        }
+        struct dm_io_region src;
+        src.bdev =  dmc->cache_dev->bdev;
+        src.sector = cache_block;
+        src.count = dmc->block_size;
 
-	cache_insert(dmc, request_block, cache_block); /* Update metadata first */
-	job = new_kcached_job(dmc, bio, request_block, cache_block);
+        job = mempool_alloc(_job_pool, GFP_NOIO);
+        job->dmc = dmc;
+        job->bio = bio;
+        job->src = src;
+        job->cacheblock = &dmc->cache[cache_block];
 
-	head = to_bytes(offset);
+//---------------------------------
+        head = to_bytes(offset);
 
-	left = (dmc->src_dev->bdev->bd_inode->i_size>>9) - request_block;
-	if (left < dmc->block_size) {
-		tail = to_bytes(left) - bio->bi_size - head;
-		job->src.count = left;
-		job->dest.count = left;
-	} else
-		tail = to_bytes(dmc->block_size) - bio->bi_size - head;
+        left = (dmc->src_dev->bdev->bd_inode->i_size>>9) - request_block;
+        if (left < dmc->block_size) {
+                tail = to_bytes(left) - bio->bi_size - head;
+                job->src.count = left;
+                job->dest.count = left;
+        } else
+                tail = to_bytes(dmc->block_size) - bio->bi_size - head;
 
-	/* Requested block is aligned with a cache block */
-	if (0 == head && 0 == tail)
-		job->nr_pages= 0;
-	else /* Need new pages to store extra data */
-		job->nr_pages = dm_div_up(head, PAGE_SIZE) + dm_div_up(tail, PAGE_SIZE);
-	job->rw = READ; /* Fetch data from the source device */
+        /* Requested block is aligned with a cache block */
+        if (0 == head && 0 == tail)
+                job->nr_pages= 0;
+        else /* Need new pages to store extra data */
+                job->nr_pages = dm_div_up(head, PAGE_SIZE) + dm_div_up(tail, PAGE_SIZE);
+        job->rw = READ; /* Fetch data from the source device */
+        job->hit = 1;
 
-	BUG_ON(job->nr_pages != 0); // should be aligned
-	DPRINTK("Queue job for %llu (need %u pages)",
-	        bio->bi_sector, job->nr_pages);
-	queue_job(job);
-	//do_pages(job);
-	//do_io(job);
+//        while(cache[cache_block].status != READY){
+  //              schedule();
+    //    }
+        cache[cache_block].status = PENDING_READ;
 
-	return 0;
+       // BUG_ON(job->nr_pages != 0); // should be aligned
+        DPRINTK("Queue job for %llu (need %u pages)",
+                bio->bi_sector, job->nr_pages);
+        queue_job(job);
+
+        return 0;
 }
+
+/*
+ * Handle a write cache hit:
+ */
+static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
+                                int hit, int writethrough) {
+        struct cacheblock *cache = dmc->cache;
+        unsigned int offset, head, tail;
+        struct kcached_job *job;
+        sector_t request_block, left;
+
+
+        offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
+        request_block = bio->bi_sector - offset;
+
+        if (cache[cache_block].state & VALID) {
+                DPRINTK("WRITE THROUGH MISS .VALID  %llu->%llu",
+                        cache[cache_block].block, request_block);
+                dmc->replace++;
+        } else DPRINTK("WRITE THROUG MISS INVALID request: %llu cache block %llu",
+                request_block, cache_block);
+
+        /* Write delay */
+        //cache_insert(dmc, request_block, cache_block); /* Update metadata first */
+        //set_state(cache[cache_block].state, DIRTY);
+        //dmc->dirty_blocks++;
+//------------job-------------------------
+//      job = new_kcached_job(dmc, bio, request_block, cache_block);
+
+        struct dm_io_region dest;
+        if(writethrough)
+                dest.bdev = dmc->src_dev->bdev;
+        else
+                dest.bdev = dmc->cache_dev->bdev;
+
+        dest.sector = bio->bi_sector;
+
+        dest.count = dmc->block_size;
+        job = mempool_alloc(_job_pool, GFP_NOIO);
+        job->dmc = dmc;
+        job->bio = bio;
+        job->dest = dest;
+        job->cacheblock = &dmc->cache[cache_block];
+        job->hit = hit ;
+
+//----------------------------------------------
+        head = to_bytes(offset);
+        left = (dmc->src_dev->bdev->bd_inode->i_size>>9) - request_block;
+        if (left < dmc->block_size) {
+                tail = to_bytes(left) - bio->bi_size - head;
+                job->src.count = left;
+                job->dest.count = left;
+        } else
+                tail = to_bytes(dmc->block_size) - bio->bi_size - head;
+
+        if (0 == head && 0 == tail) { /* Requested is aligned with a cache block */
+                job->nr_pages = 0;
+                job->rw = WRITE;
+        } else if (head && tail){ /* Special case: need to pad both head and tail */
+                job->nr_pages = dm_div_up(to_bytes(job->src.count), PAGE_SIZE);
+                job->rw = READ;
+        } else {
+                if (head) { /* Fetch only head */
+                        job->src.count = to_sector(head);
+                        job->nr_pages = dm_div_up(head, PAGE_SIZE);
+                } else { /* Fetch only tail */
+                        job->src.sector = bio->bi_sector + to_sector(bio->bi_size);
+                        job->src.count = to_sector(tail);
+                        job->nr_pages = dm_div_up(tail, PAGE_SIZE);
+                }
+                job->rw = READ;
+        }
+ //       while(cache[cache_block].status != READY){
+   //             schedule();
+     //   }
+        cache[cache_block].status = PENDING_WRITE;
+
+        queue_job(job);
+
+        return 0;
+}
+
+
 
 /*
  * Handle a write cache miss:
@@ -1310,7 +1437,7 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 
 	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
 		bio->bi_bdev = dmc->src_dev->bdev;
-		return 1;
+		return cache_write_cache(dmc, bio,cache_block,0,1);
 	}
 
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
@@ -1815,6 +1942,7 @@ init:	/* Initialize the cache structs */
 		bio_list_init(&dmc->cache[i].bios);
 		if(!persistence) dmc->cache[i].state = 0;
 		dmc->cache[i].state = 0;
+		dmc->cache[i].status = 0;
 		dmc->cache[i].counter = 0;
 		spin_lock_init(&dmc->cache[i].lock);
 	}
