@@ -165,8 +165,8 @@ struct  dm_dev dev_arr[8];
 static int cache_read_hit(struct cache_c *dmc, struct bio* bio,sector_t cache_block);
 static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
 				int hit, int writethrough);
-void validate_sector(sector_t sector_source, sector_t sector_cache);
-void validate_fetch(sector_t sector_source, struct page *fetch_page);
+void validate_sector(sector_t sector_source, sector_t sector_cache,struct cache_c *dmc);
+void validate_fetch(sector_t sector_source, struct page *fetch_page,struct cache_c *dmc);
 
 static void io_callback(unsigned long error, void *context);
 static int do_io(struct kcached_job *job);
@@ -448,38 +448,16 @@ static void io_callback(unsigned long error, void *context)
 	wake();
 }
 
-struct my_data {
-	bio_end_io_t *my_end_bio;
-	struct completion *comp;
-	void *private;
-};
 /*
-static void fetch_endio(struct bio *bio, int err)
+static void store_endio(struct bio *bio, int err)
 {
         int i;
         int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
-	struct my_data *data;
-	bio_end_io_t endio;
+        struct kcached_job *job = (struct kcached_job *) bio->bi_private;
 
         BUG_ON(!uptodate);
 	DPRINTK("COMPLETE BIO!!!! %llu",bio->bi_sector);
-	
-	data = (struct my_data *) bio->bi_private;
-	//memcpy(&data, bio->bi_private,sizeof(data));
-
-	bio->bi_private = data->private;
-	bio->bi_end_io = data->my_end_bio;
-
-	DPRINTK("2COMPLETE BIO!!!! %llu",bio->bi_sector);
-	
-	if(bio->bi_end_io){
-		DPRINTK("3COMPLETE BIO!!!! %llu",bio->bi_sector);
-		bio->bi_end_io(bio,0);
-		
-	}
-
-       // if(data->comp)
-            //   complete(data->comp);
+	io_callback(0,job);	
 }
 */
 /*
@@ -573,7 +551,9 @@ static int do_fetch(struct kcached_job *job)
 		}
 
 		job->bvec = bvec;
-		r = dm_io_async_bvec(1, &job->src, READ, job->bvec, io_callback, job);
+//		r = dm_io_async_bvec(1, &job->src, READ, job->bvec, io_callback, job);
+		r = dm_io_sync_bvec(1, &job->src, READ, job->bvec,dmc);
+			io_callback(0,job);
 		return r;
 	} else { /* The original request is a WRITE */
 		pl = job->pages;
@@ -591,8 +571,9 @@ static int do_fetch(struct kcached_job *job)
 				pl = pl->next;
 			}
 			job->bvec = bvec;
-			r = dm_io_async_bvec(1, &job->src, READ, job->bvec,
-			                     io_callback, job);
+//			r = dm_io_async_bvec(1, &job->src, READ, job->bvec,io_callback, job);
+			r = dm_io_sync_bvec(1, &job->src, READ, job->bvec,dmc);
+			io_callback(0,job);
 			return r;
 		}
 
@@ -639,8 +620,9 @@ static int do_fetch(struct kcached_job *job)
 		}
 
 		job->bvec = bvec;
-		r = dm_io_async_bvec(1, &job->src, READ, job->bvec + idx,
-		                     io_callback, job);
+//		r = dm_io_async_bvec(1, &job->src, READ, job->bvec + idx, io_callback, job);
+		r = dm_io_sync_bvec(1, &job->src, READ, job->bvec + idx, dmc);
+		io_callback(0,job);
 
 		return r;
 	}
@@ -679,15 +661,13 @@ static int do_store(struct kcached_job *job)
 	if (bio_data_dir(bio) == READ) {
 		if(job->hit != 1 ){
 			struct page *fetch_page;
-//			get_page(fetch_page);
 			fetch_page = alloc_page(GFP_KERNEL);
 			if(!fetch_page) return -ENOMEM;
 			memset(kmap(fetch_page),0,SEG_SIZE_BYTES);
 			memcpy(kmap(fetch_page),kmap(bio->bi_io_vec[0].bv_page),512);
 
-			validate_fetch(job->src.sector,fetch_page);
+			validate_fetch(job->src.sector,fetch_page,job->dmc);
 			kunmap(fetch_page);
-//			put_page(fetch_page);
 			__free_page(fetch_page);
 		}
 
@@ -753,7 +733,9 @@ static int do_store(struct kcached_job *job)
 			job->bvec = bvec;
 		}
 
-			r = dm_io_async_bvec(1, &job->dest, WRITE, job->bvec, io_callback, job);
+//			r = dm_io_async_bvec(1, &job->dest, WRITE, job->bvec, io_callback, job);
+			r = dm_io_sync_bvec(1, &job->dest, WRITE, job->bvec, dmc);
+			io_callback(0,job);
 	}
 
 	return r;
@@ -834,8 +816,8 @@ static int do_complete(struct kcached_job *job)
 			put_page(bio->bi_io_vec[i].bv_page);
 		}
 //		if(job->hit != 1 ){
-			bio_put(bio);
-			validate_sector(job->src.sector,job->dest.sector);
+		bio_put(bio);
+		validate_sector(job->src.sector,job->dest.sector,job->dmc);
 //		}
 	} else
 		bio_endio(bio, 0);
@@ -1200,13 +1182,14 @@ static int do_bio_read(struct block_device *bi_bdev, sector_t block,struct page 
 
 	/* allocate contigous pages */
 	page = alloc_page(GFP_KERNEL );
-	if(page == NULL) return -ENOMEM;
+	if(page == NULL) {
+	 	DPRINTK("Page not allocated");
+		return -ENOMEM;
+	}
 
 	/* fill all pages with 0 */
 	memset(kmap(page),0,SEG_SIZE_BYTES);
-	 	DPRINTK("Bio add page 1");
-	bio_add_page(bio, page, size, 0);
-	 	DPRINTK("Bio add page 2");
+	bio_add_page(bio, page, SEG_SIZE_BYTES, 0);
 
         /* submit the bio */
         generic_make_request(bio);
@@ -1218,13 +1201,15 @@ static int do_bio_read(struct block_device *bi_bdev, sector_t block,struct page 
 
         return req_size;
 }
-void validate_sector(sector_t sector_source, sector_t sector_cache)
+void validate_sector(sector_t sector_source, sector_t sector_cache,struct cache_c *dmc)
 {
         int size = 512;
         struct page *cache_page,*source_page;
 
-        struct block_device *cache_dev = lookup_bdev("/dev/sdc");
-        struct block_device *source_dev = lookup_bdev("/dev/dm-cache-vg2/lvm-node2-disk");
+        //struct block_device *cache_dev = lookup_bdev("/dev/sdc");
+        struct block_device *cache_dev = dmc->cache_dev->bdev;
+        //struct block_device *source_dev = lookup_bdev("/dev/dm-cache-vg2/lvm-node2-disk");
+        struct block_device *source_dev =  dmc->src_dev->bdev;
 
         cache_page = alloc_page(GFP_KERNEL );
         if(!cache_page) return -ENOMEM;
@@ -1238,9 +1223,9 @@ void validate_sector(sector_t sector_source, sector_t sector_cache)
         do_bio_read(source_dev,sector_source,source_page);
 
         if(0==memcmp(kmap(cache_page),kmap(source_page),size)){
-                DPRINTK("STORE block %llu are EQUALS\n",sector_cache);
+                DPRINTK("STORE block %llu -> %llu are EQUALS\n",sector_cache, sector_source);
         }else{
-                DPRINTK("STORE block %llu are DIFFERENT\n",sector_cache);
+                DPRINTK("STORE block %llu -> %llu are DIFFERENT\n",sector_cache, sector_source);
         }
 	kunmap(cache_page);
 	kunmap(source_page);
@@ -1249,12 +1234,13 @@ void validate_sector(sector_t sector_source, sector_t sector_cache)
 
         return ;
 }
-void validate_fetch(sector_t sector_source, struct page *fetch_page)
+void validate_fetch(sector_t sector_source, struct page *fetch_page, struct cache_c *dmc)
 {
         int size = 512;
         struct page *cache_page,*source_page;
 
-        struct block_device *source_dev = lookup_bdev("/dev/dm-cache-vg2/lvm-node2-disk");
+        //struct block_device *source_dev = lookup_bdev("/dev/dm-cache-vg2/lvm-node2-disk");
+        struct block_device *source_dev =  dmc->src_dev->bdev;
 
         source_page = alloc_page(GFP_KERNEL);
         if(!source_page) return -ENOMEM;
@@ -1427,8 +1413,8 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		bio->bi_bdev = dmc->cache_dev->bdev;
 		bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
 
-	        return cache_read_hit(dmc,bio,cache_block);
-/*
+//	        return cache_read_hit(dmc,bio,cache_block);
+
 		spin_lock(&cache[cache_block].lock);
 
 		if (is_state(cache[cache_block].state, VALID)) { // Valid cache block 
@@ -1442,13 +1428,13 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		bio_list_add(&cache[cache_block].bios, bio);
 
 		spin_unlock(&cache[cache_block].lock);
-		return 0;*/
+		return 0;
 	} else { /* WRITE hit */
 		if (dmc->write_policy == WRITE_THROUGH) { /* Invalidate cached data */
 			cache_invalidate(dmc, cache_block);
 			bio->bi_bdev = dmc->src_dev->bdev;
-			return cache_write_cache(dmc, bio,cache_block,1,1);
-			//return 1;
+			//return cache_write_cache(dmc, bio,cache_block,1,1);
+			return 1;
 		}
 
 		/* Write delay */
@@ -1684,7 +1670,8 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 
 	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
 		bio->bi_bdev = dmc->src_dev->bdev;	//	return 1;
-		return cache_write_cache(dmc, bio,cache_block,0,1);
+		return 1;
+		//return cache_write_cache(dmc, bio,cache_block,0,1);
 	}
 
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
