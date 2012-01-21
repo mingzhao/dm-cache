@@ -4,8 +4,8 @@ function create {
 
 insmod dm-cache.ko
 
-echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node2-disk  /dev/sdc 0 1 131072 1024 0 | dmsetup create cache2
-echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node3-disk  /dev/sdc 0 1 131072 1024 0 | dmsetup create cache3
+echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node2-disk  /dev/sdc 0 1 131072 1 0 | dmsetup create cache2
+echo 0 6291456 cache /dev/dm-cache-vg2/lvm-node3-disk  /dev/sdc 0 1 131072 1 0 | dmsetup create cache3
 }
 
 function create2 {
