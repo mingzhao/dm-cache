@@ -1065,9 +1065,9 @@ static int cache_lookup1(struct cache_c *dmc, sector_t block_in,
         sector_t block = *(sector_t *)blockst;
 
 
-//      unsigned long set_number = hash_block(dmc, block);
+	unsigned long set_number = hash_block(dmc, block);
         block = block_ori;
-        unsigned long set_number = block_ori;
+//        unsigned long set_number = block_ori;
 
         sector_t index;
         int i, res;
@@ -1289,9 +1289,9 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
 	int invalid = -1, oldest = -1, oldest_clean = -1;
 	unsigned long counter = ULONG_MAX, clean_counter = ULONG_MAX;
 
-	//blockst->disk = disk;
-	//block = *(sector_t *)blockst;
-	 block = block_ori;
+	 blockst->disk = disk;
+	 block = *(sector_t *)blockst;
+	// block = block_ori;
 
 	set_number = hash_block(dmc, block);
 	cache_assoc = dmc->assoc;
