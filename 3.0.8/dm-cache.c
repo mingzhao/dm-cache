@@ -807,43 +807,35 @@ static int do_complete(struct kcached_job *job)
         int i, r = 0;
         struct bio *bio = job->bio;
 
-        DPRINTK("do_complete: %llu", bio->bi_sector);
+        DPRINTK("do_complete: %llu",(unsigned long long int) bio->bi_sector);
 
-        if(bio_data_dir(bio) == READ && job->hit == 1 ){
-                for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
-                        get_page(bio->bi_io_vec[i].bv_page);
-                }
-                bio_endio(bio,0);
-        }
-
-        if (bio_data_dir(bio) == READ) {
+        if (bio_data_dir(bio) == READ  && job->hit != 1) {
                 for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
                         put_page(bio->bi_io_vec[i].bv_page);
                 }
-                if(job->hit != 1 )
-                        bio_put(bio);
+                bio_put(bio);
+                validate_sector(job->src.sector,job->dest.sector,job->dmc);
         } else
                 bio_endio(bio, 0);
+
         if (job->nr_pages > 0) {
                 kfree(job->bvec);
                 kcached_put_pages(job->dmc, job->pages);
         }
 
         if(job->hit != 1 )
-		flush_bios(job->cacheblock);
+                flush_bios(job->cacheblock);
 
-	//spin_lock(&job->cacheblock->lock);
-	//job->cacheblock->status = READY;
-	atomic_set(&job->cacheblock->status, 0);
-	//spin_unlock(&job->cacheblock->lock);
-	mempool_free(job, _job_pool);
+        atomic_set(&job->cacheblock->status, 0);
+
+        mempool_free(job, _job_pool);
 
         if (atomic_dec_and_test(&job->dmc->nr_jobs))
                 wake_up(&job->dmc->destroyq);
 
-	//validate_sector(bio->bi_sector,job->cacheblock->block);	
         bio_in_progress = 0;
         return r;
+
 }
 
 
@@ -1186,8 +1178,8 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
         int invalid = -1, oldest = -1, oldest_clean = -1;
         unsigned long counter = ULONG_MAX, clean_counter = ULONG_MAX;
 
-//        block = *(sector_t *)blockst;
-//        blockst->disk = disk;
+        block = *(sector_t *)blockst;
+        blockst->disk = disk;
 
         set_number = hash_block(dmc, block);
         cache_assoc = dmc->assoc;
@@ -1417,9 +1409,9 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
 		bio->bi_sector = cache_block ;
 	
-     return cache_read_hit(dmc,bio,cache_block);
+//    return cache_read_hit(dmc,bio,cache_block);
 
-/*		spin_lock(&cache[cache_block].lock);
+		spin_lock(&cache[cache_block].lock);
 
 		if (is_state(cache[cache_block].state, VALID)) { // Valid cache block 
 			spin_unlock(&cache[cache_block].lock);
@@ -1436,15 +1428,15 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		spin_unlock(&cache[cache_block].lock);
 		DPRINTK("Add1 to bio list %s(%llu)",
 				dmc->cache_dev->name, bio->bi_sector);
-		return 0;*/
+		return 0;
 	} else { /* WRITE hit */
 		if (dmc->write_policy == WRITE_THROUGH) { /* Invalidate cached data */
 			if (is_state(cache[cache_block].state, VALID)) {
 				DPRINTK("WRITE THROUGH VALID!!!");
 				cache_invalidate(dmc, cache_block);
 				bio->bi_bdev = dmc->src_dev->bdev;
-				return cache_write_cache(dmc, bio,cache_block,1,1);
-//				return 1;
+//				return cache_write_cache(dmc, bio,cache_block,1,1);
+				return 1;
 			}
 			
 				DPRINTK("WRITE THROUGH INVALID!!!");
@@ -1779,7 +1771,8 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 
 	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
 		bio->bi_bdev = dmc->src_dev->bdev;
-		return cache_write_cache(dmc, bio,cache_block,0,1);
+		return 1;
+//		return cache_write_cache(dmc, bio,cache_block,0,1);
 	}
 
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
