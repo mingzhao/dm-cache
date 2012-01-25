@@ -172,7 +172,7 @@ static int do_complete(struct kcached_job *job);
 static int do_bio_read(struct block_device *bi_bdev, sector_t block,struct page *page_read);
 
 
-#define SEG_SIZE_ORDER  0 
+#define dfEG_SIZE_ORDER  0 
 #define SEG_SIZE_BYTES  512
 
 
@@ -615,7 +615,7 @@ static int do_fetch(struct kcached_job *job)
 		job->bvec = bvec;
 //		r = dm_io_async_bvec(1, &job->src, READ, job->bvec + idx,
 //		                     io_callback, job);
-		r = dm_io_sync_bvec(1, &job->src, READ, job->bvec,dmc);
+		r = dm_io_sync_bvec(1, &job->src, READ, job->bvec + idx ,dmc);
 		io_callback(0,job);
 
 		printk("do_fetch end");
@@ -659,7 +659,6 @@ static int do_store(struct kcached_job *job)
 	   insertion is completed.
 	 */
 	if (bio_data_dir(bio) == READ) {
-
 		if(job->hit != 1 ){
 			struct page *fetch_page;
 			fetch_page = alloc_page(GFP_KERNEL);
@@ -671,6 +670,7 @@ static int do_store(struct kcached_job *job)
 			kunmap(fetch_page);
 			__free_page(fetch_page);
 		}
+/*
 		clone = bio_clone(bio, GFP_NOIO);
 		for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
 			get_page(bio->bi_io_vec[i].bv_page);
@@ -679,6 +679,7 @@ static int do_store(struct kcached_job *job)
 		bio_endio(bio, 0);
 		bio = clone;
 		job->bio = clone;
+*/
 	}
 
 	if (0 == job->nr_pages){ /* Original request is aligned with cache blocks */
@@ -733,8 +734,8 @@ static int do_store(struct kcached_job *job)
 		}
 
 //		r = dm_io_async_bvec(1, &job->dest, WRITE, job->bvec, io_callback, job);
-			r = dm_io_sync_bvec(1, &job->dest, WRITE, job->bvec, dmc);
-			io_callback(0,job);
+		r = dm_io_sync_bvec(1, &job->dest, WRITE, job->bvec, dmc);
+		io_callback(0,job);
 	}
 	//spin_unlock_irqrestore(&store_lock, flags);
 	return r;
@@ -808,7 +809,7 @@ static int do_complete(struct kcached_job *job)
         struct bio *bio = job->bio;
 
         DPRINTK("do_complete: %llu",(unsigned long long int) bio->bi_sector);
-
+/*
         if (bio_data_dir(bio) == READ  && job->hit != 1) {
                 for (i=bio->bi_idx; i<bio->bi_vcnt; i++) {
                         put_page(bio->bi_io_vec[i].bv_page);
@@ -817,14 +818,17 @@ static int do_complete(struct kcached_job *job)
                 validate_sector(job->src.sector,job->dest.sector,job->dmc);
         } else
                 bio_endio(bio, 0);
+*/
+	validate_sector(job->src.sector,job->dest.sector,job->dmc);
+	bio_endio(bio, 0);
 
         if (job->nr_pages > 0) {
                 kfree(job->bvec);
                 kcached_put_pages(job->dmc, job->pages);
         }
 
-        if(job->hit != 1 )
-                flush_bios(job->cacheblock);
+        //if(job->hit != 1 )
+        flush_bios(job->cacheblock);
 
         atomic_set(&job->cacheblock->status, 0);
 
@@ -833,7 +837,7 @@ static int do_complete(struct kcached_job *job)
         if (atomic_dec_and_test(&job->dmc->nr_jobs))
                 wake_up(&job->dmc->destroyq);
 
-        bio_in_progress = 0;
+        //bio_in_progress = 0;
         return r;
 
 }
@@ -1178,8 +1182,8 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
         int invalid = -1, oldest = -1, oldest_clean = -1;
         unsigned long counter = ULONG_MAX, clean_counter = ULONG_MAX;
 
-        block = *(sector_t *)blockst;
         blockst->disk = disk;
+        block = *(sector_t *)blockst;
 
         set_number = hash_block(dmc, block);
         cache_assoc = dmc->assoc;
@@ -1217,7 +1221,6 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
                         if (-1 == invalid) invalid = i;
                 }
         }
-
 
         res = i < cache_assoc ? 1 : 0;
         if (!res) { /* Cache miss */
@@ -1496,8 +1499,8 @@ static struct kcached_job *new_kcached_job(struct cache_c *dmc, struct bio* bio,
 	src.sector = request_block;
 	src.count = dmc->block_size;
 	dest.bdev = dmc->cache_dev->bdev;
-	//dest.sector = cache_block << dmc->block_shift;
-	dest.sector = cache_block;
+	dest.sector = cache_block << dmc->block_shift;
+	//dest.sector = cache_block;
 
 	dest.count = src.count;
 
