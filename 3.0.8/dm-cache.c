@@ -52,10 +52,13 @@
 #define DPRINTK( s, arg... )
 #endif
 
-int counter_map;
+#define MAX_SRC_DEVICES		8
+
+int 	counter_map;
 int	dm_dev_identifier = 0;
-struct 	dm_dev dev_arr[8];  
-int    bio_in_progress = 0;
+struct 	dm_dev dev_arr[MAX_SRC_DEVICES];  
+int 	bio_in_progress = 0;
+int	init_cache_structure = 0;
 
 /* Default cache parameters */
 #define DEFAULT_CACHE_SIZE	65536
@@ -1410,7 +1413,7 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 	if (bio_data_dir(bio) == READ) { /* READ hit */
 		bio->bi_bdev = dmc->cache_dev->bdev;
 		bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
-		bio->bi_sector = cache_block ;
+	//	bio->bi_sector = cache_block ;
 	
 //    return cache_read_hit(dmc,bio,cache_block);
 
@@ -1839,12 +1842,15 @@ static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block
 
 static int get_disk_identifier (struct cache_c *dmc)
 {
- 	int i, ret = 0;
+ 	int i, ret = -1;
+	DPRINTK("DISK-IDENTIFIER SRC:%llu 1:%llu",
+			dmc->src_dev->bdev->bd_dev,
+			dev_arr[i].bdev->bd_dev );
  	for (i = 0 ; i < dm_dev_identifier ; i++){
- 		if(dev_arr->bdev->bd_dev == dmc->src_dev->bdev->bd_dev)
+ 		if(dev_arr[i].bdev->bd_dev == dmc->src_dev->bdev->bd_dev)
  			ret = i;
  	}
- 	DPRINTK("SOURCE: %llu ret: %d",dmc->src_dev->bdev->bd_dev,ret);
+ 	DPRINTK("SOURCE: %llu ret: %d total: %d",dmc->src_dev->bdev->bd_dev,ret,dm_dev_identifier);
  	return ret;
 }
 
@@ -1874,7 +1880,7 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 	        bio_rw(bio) == WRITE ? "WRITE" : (bio_rw(bio) == READ ?
 	        "READ":"READA"), bio->bi_sector, request_block, offset,
 	        bio->bi_size);
-	DPRINTK("Counter_map: %d",++counter_map);
+	//DPRINTK("Counter_map: %d",++counter_map);
 
 	if (bio_data_dir(bio) == READ) dmc->reads++;
 	else dmc->writes++;
@@ -1959,13 +1965,13 @@ static int load_metadata(struct cache_c *dmc) {
 	order = dmc->size * sizeof(struct cacheblock);
 	DMINFO("Allocate %lluKB (%luB per) mem for %llu-entry cache" \
 	       "(capacity:%lluMB, associativity:%u, block size:%u " \
-	       "sectors(%uKB), %s)",
+	       "sectors(%uKB), %s) Shift:%d",
 	       (unsigned long long) order >> 10, (unsigned long) sizeof(struct cacheblock),
 	       (unsigned long long) dmc->size,
 	       (unsigned long long) dmc->size * dmc->block_size >> (20-SECTOR_SHIFT),
 	       dmc->assoc, dmc->block_size,
 	       dmc->block_size >> (10-SECTOR_SHIFT),
-	       dmc->write_policy ? "write-back" : "write-through");
+	       dmc->write_policy ? "write-back" : "write-through",dmc->block_shift);
 	dmc->cache = (struct cacheblock *)vmalloc(order);
 	if (!dmc->cache) {
 		DMERR("load_metadata: Unable to allocate memory");
@@ -2125,6 +2131,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "dm-cache: Source device lookup failed";
 		goto bad1;
 	}else {
+		DPRINTK("Registering device %s",argv[0]);
 	        dev_arr[dm_dev_identifier++] = *dmc->src_dev;
 	}
 
@@ -2259,13 +2266,14 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	localsize = data_size >> 11;
 	DMINFO("Allocate %lluKB (%luB per) mem for %llu-entry cache" \
 	       "(capacity:%lluMB, associativity:%u, block size:%u " \
-	       "sectors(%uKB), %s)",
+	       "sectors(%uKB), %s) Shift:%d Consecutive Shitfs:%d Consecutive Blocs:%d",
 	       (unsigned long long) order >> 10, (unsigned long) sizeof(struct cacheblock),
 	       (unsigned long long) dmc->size,
 	       (unsigned long long) data_size >> (20-SECTOR_SHIFT),
 	       dmc->assoc, dmc->block_size,
 	       dmc->block_size >> (10-SECTOR_SHIFT),
-	       dmc->write_policy ? "write-back" : "write-through");
+	       dmc->write_policy ? "write-back" : "write-through",
+		dmc->block_shift,dmc->consecutive_shift,consecutive_blocks);
 
 	dmc->cache = (struct cacheblock *)vmalloc(order);
 	if (!dmc->cache) {
@@ -2280,7 +2288,6 @@ init:	/* Initialize the cache structs */
 		if(!persistence) dmc->cache[i].state = 0;
 		dmc->cache[i].state = 0;
 		atomic_set(&dmc->cache[i].status, 0);
-//		dmc->cache[i].status = 0;
 		dmc->cache[i].counter = 0;
 		spin_lock_init(&dmc->cache[i].lock);
 	}
