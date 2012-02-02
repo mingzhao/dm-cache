@@ -48,8 +48,12 @@
 
 #if DMC_DEBUG
 #define DPRINTK( s, arg... ) printk(DMC_PREFIX s "\n", ##arg)
+#define VALSECTOR( w,x,y,z) validate_sector(w,x,y,z)
+#define VALFETCH( x, y, z  ) validate_fetch(x,y,z)
 #else
 #define DPRINTK( s, arg... )
+#define VALSECTOR( w,x,y,z) 
+#define VALFETCH(x,y,z) 
 #endif
 
 /* Default cache parameters */
@@ -101,6 +105,7 @@ int	dm_dev_identifier = 0;
 struct v_map {
 	struct dm_dev *src_dev;
 	dev_t vcache_dev;
+	struct dm_target *ti;
 } virtual_mapping[MAX_SRC_DEVICES];
 
 int	init_flag = 0;
@@ -675,7 +680,7 @@ static int do_store(struct kcached_job *job)
 			memset(kmap(fetch_page),0,SEG_SIZE_BYTES);
 			memcpy(kmap(fetch_page),kmap(bio->bi_io_vec[0].bv_page),512);
 
-			validate_fetch(job->src.sector,fetch_page,job->vdisk);
+			VALFETCH(job->src.sector,fetch_page,job->vdisk);
 			kunmap(fetch_page);
 			__free_page(fetch_page);
 		}
@@ -824,7 +829,7 @@ static int do_complete(struct kcached_job *job)
         } else
                 bio_endio(bio, 0);
 */
-	validate_sector(job->src.sector,job->dest.sector,job->dmc, job->vdisk);
+	VALSECTOR (job->src.sector,job->dest.sector,job->dmc, job->vdisk);
 	bio_endio(bio, 0);
 
         if (job->nr_pages > 0) {
@@ -1934,7 +1939,8 @@ static int virtual_cache_map(struct bio *bio)
 static int cache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
 {
-	struct cache_c *dmc = (struct cache_c *) ti->private;
+//	struct cache_c *dmc = (struct cache_c *) ti->private;
+	struct cache_c *dmc = &shared_cache;
 /*
 	//int pos = virtual_cache_map(bio,dmc);
 	//bio->bi_bdev = virtual_mapping[virtual_cache_map(bio)].src_dev->bdev;
@@ -2215,15 +2221,17 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	//Adding source device
 	r = dm_get_device(ti, argv[0],
-			dm_table_get_mode(ti->table), &dmc->src_dev);
+			dm_table_get_mode(ti->table), &virtual_mapping[dm_dev_identifier].src_dev);
+//			dm_table_get_mode(ti->table), &dmc->src_dev);
 
-	virtual_mapping[dm_dev_identifier].src_dev = dmc->src_dev;
+//	virtual_mapping[dm_dev_identifier].src_dev = dmc->src_dev;
+	virtual_mapping[dm_dev_identifier].ti = ti;
 //	dmc->src_dev = dmc->src_devs[dm_dev_identifier];
 	if (r) {
 		ti->error = "dm-cache: Source device lookup failed";
 		goto bad1;
 	}else {
-		DPRINTK("Registering device %s:%llu",argv[0],
+		DPRINTK("Registering device %s:%llu",virtual_mapping[dm_dev_identifier].src_dev->name,
 				(long long unsigned int)virtual_mapping[dm_dev_identifier].src_dev->bdev->bd_dev);
 	//	dev_arr[dm_dev_identifier] = dmc->src_devs[dm_dev_identifier];
 	}
@@ -2239,24 +2247,25 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}else {
 		virtual_mapping[dm_dev_identifier].vcache_dev = virtual_cache->bdev->bd_dev;
 		
-		dm_put_device(ti, virtual_cache);
 		DPRINTK("Registering %d device %s:%llu",
 				dm_dev_identifier,
 				dm_device_name(mapped_dev),
 				(long long unsigned int)virtual_mapping[dm_dev_identifier].vcache_dev);
+		dm_put_device(ti, virtual_cache);
 		dm_dev_identifier++;
 	}
 
 	//Adding global cache device
-	r = dm_get_device(ti, argv[1],
-			  dm_table_get_mode(ti->table), &dmc->cache_dev);
-	if (r) {
-		ti->error = "dm-cache: Cache device lookup failed";
-		goto bad2;
-	}else{
-		DPRINTK("Registering device %s:%llu",argv[1],
-				(long long unsigned int)dmc->cache_dev->bdev->bd_dev);
-
+	if(init_flag == 0) {
+		r = dm_get_device(ti, argv[1],
+				dm_table_get_mode(ti->table), &dmc->cache_dev);
+		if (r) {
+			ti->error = "dm-cache: Cache device lookup failed";
+			goto bad2;
+		}else{
+			DPRINTK("Registering device %s:%llu",argv[1],
+					(long long unsigned int)dmc->cache_dev->bdev->bd_dev);
+		}
 	}
 
 	if(dmc->io_client == NULL)
@@ -2430,7 +2439,8 @@ init:	/* Initialize the cache structs */
 	dmc->dirty = 0;
 init_sc:
 	ti->split_io = dmc->block_size;
-	ti->private = dmc;
+//	ti->private = dmc;
+	ti->private = &virtual_mapping[dm_dev_identifier-1];
 
 	init_flag = 1;
 	return 0;
@@ -2479,33 +2489,42 @@ static void cache_flush(struct cache_c *dmc)
  */
 static void cache_dtr(struct dm_target *ti)
 {
-	int i = 0 ;
-	struct cache_c *dmc = (struct cache_c *) ti->private;
+//	struct cache_c *dmc = (struct cache_c *) ti->private;
+	struct cache_c *dmc = &shared_cache;
+//	struct dm_dev *virtual_cache = (struct dm_dev *) ti->private;
+	struct v_map *map_dev = (struct v_map *) ti->private;
+
+	DPRINTK("DTR %s",map_dev->src_dev->name);
 
 	if (dmc->dirty_blocks > 0) cache_flush(dmc);
 
-	kcached_client_destroy(dmc);
+	if(dm_dev_identifier == 1){
+		kcached_client_destroy(dmc);
 
-	dm_kcopyd_client_destroy(dmc->kcp_client);
+		dm_kcopyd_client_destroy(dmc->kcp_client);
 
-	if (dmc->reads + dmc->writes > 0)
-		DMINFO("stats: reads(%lu), writes(%lu), cache hits(%lu, 0.%lu)," \
-		       "replacement(%lu), replaced dirty blocks(%lu), " \
-	           "flushed dirty blocks(%lu)",
-		       dmc->reads, dmc->writes, dmc->cache_hits,
-		       dmc->cache_hits * 100 / (dmc->reads + dmc->writes),
-		       dmc->replace, dmc->writeback, dmc->dirty);
+		if (dmc->reads + dmc->writes > 0)
+			DMINFO("stats: reads(%lu), writes(%lu), cache hits(%lu, 0.%lu)," \
+					"replacement(%lu), replaced dirty blocks(%lu), " \
+					"flushed dirty blocks(%lu)",
+					dmc->reads, dmc->writes, dmc->cache_hits,
+					dmc->cache_hits * 100 / (dmc->reads + dmc->writes),
+					dmc->replace, dmc->writeback, dmc->dirty);
 
-	dump_metadata(dmc); /* Always dump metadata to disk before exit */
-	vfree((void *)dmc->cache);
-	dm_io_client_destroy(dmc->io_client);
-
+		dump_metadata(dmc); /* Always dump metadata to disk before exit */
+		vfree((void *)dmc->cache);
+		dm_io_client_destroy(dmc->io_client);
+		dm_put_device(ti, dmc->cache_dev);
+		init_flag = 0;
+	}
 	DPRINTK("Destroying devices!");
 
-	for (i=0; i < dm_dev_identifier ; i++)
-		dm_put_device(ti,virtual_mapping[i].src_dev );
-//	dm_put_device(ti, dmc->src_dev);
-	dm_put_device(ti, dmc->cache_dev);
+		//dm_put_device(ti,virtual_mapping[0].src_dev );
+//		dm_put_device(ti, dmc->src_dev);
+//		dm_put_device(ti,virtual_cache);
+		dm_put_device(map_dev->ti,map_dev->src_dev);
+	
+	dm_dev_identifier--;
 	//kfree(dmc);
 }
 
@@ -2517,7 +2536,8 @@ static void cache_dtr(struct dm_target *ti)
 static int cache_status(struct dm_target *ti, status_type_t type,
 			 char *result, unsigned int maxlen)
 {
-	struct cache_c *dmc = (struct cache_c *) ti->private;
+//	struct cache_c *dmc = (struct cache_c *) ti->private;
+	struct cache_c *dmc = &shared_cache;
 	int sz = 0;
 
 	switch (type) {
