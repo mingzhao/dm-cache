@@ -41,7 +41,7 @@
 #include <linux/dm-io.h>
 #include <linux/dm-kcopyd.h>
 
-#define DMC_DEBUG 1
+#define DMC_DEBUG 0
 
 #define DM_MSG_PREFIX "cache"
 #define DMC_PREFIX "dm-cache: "
