@@ -41,7 +41,7 @@
 #include <linux/dm-io.h>
 #include <linux/dm-kcopyd.h>
 
-#define DMC_DEBUG 0
+#define DMC_DEBUG 1
 
 #define DM_MSG_PREFIX "cache"
 #define DMC_PREFIX "dm-cache: "
@@ -105,6 +105,10 @@ int	dm_dev_identifier = 0;
 struct v_map {
 	struct dm_dev *src_dev;
 	dev_t vcache_dev;
+
+	sector_t dev_size;
+	sector_t dev_offset;
+
 	struct dm_target *ti;
 } virtual_mapping[MAX_SRC_DEVICES];
 
@@ -1204,8 +1208,13 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
         blockst->disk = disk;
 
 //      block = *(sector_t *)blockst;
-        block = block_ori + (disk * 6291456);
-
+//      block = block_ori + (disk * 6291456);
+        block = block_ori + virtual_mapping[disk].dev_offset;
+	DPRINTK("Lookup--> block orig: %llu, offset: %llu , block: %llu ",
+		(unsigned long long) block_ori,
+		(unsigned long long) virtual_mapping[disk].dev_offset,
+		(unsigned long long) block
+		);
         set_number = hash_block(dmc, block);
         cache_assoc = dmc->assoc;
 
@@ -2182,6 +2191,20 @@ static int dump_metadata(struct cache_c *dmc) {
 	return 0;
 }
 
+static sector_t calculate_offset( int num_devices)
+{
+	sector_t ret = 0;
+	int i;
+		DPRINTK("start Calculate offset: %d",num_devices);
+
+	for (i=0 ; i < num_devices ; i++ ){
+		DPRINTK("Calculate offset: %d",num_devices);
+		ret = ret + virtual_mapping[i].dev_size;
+	}
+		DPRINTK("finish Calculate offset: %d",ret);
+
+	return ret;
+}
 /*
  * Construct a cache mapping.
  *  arg[0]: path to source device
@@ -2236,6 +2259,10 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	//	dev_arr[dm_dev_identifier] = dmc->src_devs[dm_dev_identifier];
 	}
 
+	//Calculate Size and offset of the device
+	virtual_mapping[dm_dev_identifier].dev_size = ti->len;
+	virtual_mapping[dm_dev_identifier].dev_offset = calculate_offset(dm_dev_identifier);
+
 	//Adding virtual cache devices
 	mapped_dev = dm_table_get_md(ti->table);
 
@@ -2254,6 +2281,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		dm_put_device(ti, virtual_cache);
 		dm_dev_identifier++;
 	}
+
 
 	//Adding global cache device
 	if(init_flag == 0) {
