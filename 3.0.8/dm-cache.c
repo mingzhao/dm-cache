@@ -123,6 +123,7 @@ struct cache_c {
 	struct dm_dev *src_dev;		/* Source devices*/
 
 	struct dm_dev *cache_dev;	/* Cache device */
+	struct dm_target *global_ti;	/* global dm_target to hold global cache */	
 	struct dm_kcopyd_client *kcp_client; /* Kcopyd client for writing back data */
 
 	struct cacheblock *cache;	/* Hash table for cache blocks */
@@ -158,6 +159,7 @@ struct cache_c {
 struct cacheblock {
 	spinlock_t lock;	/* Lock to protect operations on the bio list */
 	sector_t block;		/* Sector number of the cached block */
+	int	disk;		/* Disk identifier for LV of each VM */
 	unsigned short state;	/* State of a block */
 	atomic_t status; 
 	unsigned long counter;	/* Logical timestamp of the block's last access */
@@ -184,7 +186,7 @@ struct kcached_job {
 	struct page_list *pages;
 };
 
-static int cache_insert(struct cache_c *dmc, sector_t block,sector_t cache_block); 
+static int cache_insert(struct cache_c *dmc, sector_t block,sector_t cache_block,int disk); 
 //static int cache_read_hit(struct cache_c *dmc, struct bio* bio,sector_t cache_block);
 //static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
 //                                int hit, int writethrough);
@@ -1226,7 +1228,8 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
 //                       DPRINTK("VALID %llu - %llu - %llu" ,cache[index].block,block,block_in);
 //                       DPRINTK("Index %llu - %llu" ,index,block_ori);
 
-                        if (cache[index].block == block_ori) {
+                        if (cache[index].block == block_ori && 
+				cache[index].disk == disk) {
                                 *cache_block = index;
                                 /* Reset all counters if the largest one is going to overflow */
                                 if (dmc->counter == ULONG_MAX) cache_reset_counter(dmc);
@@ -1399,13 +1402,14 @@ static int cache_lookup1(struct cache_c *dmc, sector_t block_in,
  * Insert a block into the cache (in the frame specified by cache_block).
  */
 static int cache_insert(struct cache_c *dmc, sector_t block,
-	                    sector_t cache_block)
+	                    sector_t cache_block, int disk)
 {
 	struct cacheblock *cache = dmc->cache;
 
 	/* Mark the block as RESERVED because although it is allocated, the data are
        not in place until kcopyd finishes its job.
 	 */
+	cache[cache_block].disk = disk;
 	cache[cache_block].block = block;
 	cache[cache_block].state = RESERVED;
 	if (dmc->counter == ULONG_MAX) cache_reset_counter(dmc);
@@ -1565,7 +1569,7 @@ static struct kcached_job *new_kcached_job(struct cache_c *dmc, struct bio* bio,
  *  store data to cache device.
  */
 static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
-	                       sector_t cache_block) {
+	                       sector_t cache_block, int disk) {
 	struct cacheblock *cache = dmc->cache;
 	unsigned int offset, head, tail;
 	struct kcached_job *job;
@@ -1584,7 +1588,7 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 			(long long unsigned int)cache_block);
 
 
-	cache_insert(dmc, request_block, cache_block); /* Update metadata first */
+	cache_insert(dmc, request_block, cache_block, disk); /* Update metadata first */
 	job = new_kcached_job(dmc, bio, request_block, cache_block);
 
 	head = to_bytes(offset);
@@ -1825,7 +1829,7 @@ static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cach
  *  If write-back, update the metadata; fetch the necessary block from source
  *  device; write to cache device.
  */
-static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block) {
+static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block,int disk) {
 	struct cacheblock *cache = dmc->cache;
 	unsigned int offset, head, tail;
 	struct kcached_job *job;
@@ -1851,7 +1855,7 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 			(long long unsigned int)cache_block);
 
 	/* Write delay */
-	cache_insert(dmc, request_block, cache_block); /* Update metadata first */
+	cache_insert(dmc, request_block, cache_block,disk); /* Update metadata first */
 	set_state(cache[cache_block].state, DIRTY);
 	dmc->dirty_blocks++;
 
@@ -1891,11 +1895,11 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 }
 
 /* Handle cache misses */
-static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block) {
+static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block, int disk) {
 	if (bio_data_dir(bio) == READ)
-		return cache_read_miss(dmc, bio, cache_block);
+		return cache_read_miss(dmc, bio, cache_block,disk);
 	else
-		return cache_write_miss(dmc, bio, cache_block);
+		return cache_write_miss(dmc, bio, cache_block,disk);
 }
 
 
@@ -1996,7 +2000,7 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 	if (1 == res)  /* Cache hit; server request from cache */
 		return  cache_hit(dmc, bio, cache_block);
 	else if (0 == res) /* Cache miss; replacement block is found */
-		return  cache_miss(dmc, bio, cache_block);
+		return  cache_miss(dmc, bio, cache_block,disk);
 	else if (2 == res) { /* Entire cache set is dirty; initiate a write-back */
 		write_back(dmc, cache_block, 1);
 		dmc->writeback++;
@@ -2201,7 +2205,7 @@ static sector_t calculate_offset( int num_devices)
 		DPRINTK("Calculate offset: %d",num_devices);
 		ret = ret + virtual_mapping[i].dev_size;
 	}
-		DPRINTK("finish Calculate offset: %d",ret);
+		DPRINTK("finish Calculate offset: %llu",(unsigned long long)ret);
 
 	return ret;
 }
@@ -2431,14 +2435,14 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 //---------------------
 	DMINFO("Allocate %lluKB (%luB per) mem for %llu-entry cache" \
 	       "(capacity:%lluMB, associativity:%u, block size:%u " \
-	       "sectors(%uKB), %s) Shift:%d Consecutive Shitfs:%d Consecutive Blocs:%d",
+	       "sectors(%uKB), %s) table %llu",
 	       (unsigned long long) order >> 10, (unsigned long) sizeof(struct cacheblock),
 	       (unsigned long long) dmc->size,
 	       (unsigned long long) data_size >> (20-SECTOR_SHIFT),
 	       	dmc->assoc, dmc->block_size,
 	       	dmc->block_size >> (10-SECTOR_SHIFT),
 		dmc->write_policy ? "write-back" : "write-through",
-		dmc->block_shift,dmc->consecutive_shift,consecutive_blocks);
+		(unsigned long long)ti->table);
 	
 	dmc->cache = (struct cacheblock *)vmalloc(order);
 	if (!dmc->cache) {
