@@ -98,23 +98,25 @@
 /*
 * Virtual Cache Mapping
 */
-#define MAX_SRC_DEVICES		8
+#define MAX_SRC_DEVICES		128
 
-int	dm_dev_identifier = 0;
+int 	idx_dm_dev = 0;
+int 	ctn_dm_dev = 0;
+
 
 struct v_map {
-	struct dm_dev *src_dev;
-	dev_t vcache_dev;
+	int		active;
+	dev_t 		vcache_dev;
 
-	sector_t dev_size;
-	sector_t dev_offset;
+	sector_t 	dev_size;
+	sector_t 	dev_offset;
 
+	struct dm_dev 	*src_dev;
 	struct dm_target *ti;
 } virtual_mapping[MAX_SRC_DEVICES];
 
 int	init_flag = 0;
 int	init_cache_structure = 0;
-//struct 	dm_dev *dev_arr[MAX_SRC_DEVICES];  
 
 /*
  * Cache context
@@ -382,11 +384,6 @@ static struct kmem_cache *_job_cache;
 static mempool_t *_job_pool;
 
 static DEFINE_SPINLOCK(_job_lock);
-
-//static DEFINE_SPINLOCK(fetch_lock);
-//static DEFINE_SPINLOCK(store_lock);
-//static DEFINE_SPINLOCK(io_lock);
-//static DEFINE_SPINLOCK(bio_lock);
 
 //unsigned long bio_flags;  
 
@@ -904,18 +901,9 @@ static void queue_job(struct kcached_job *job)
 	atomic_inc(&job->dmc->nr_jobs);
 	if (job->nr_pages > 0) /* Request pages */
 		push(&_pages_jobs, job);
-	else /* Go ahead to do I/O */{
-	//	spin_lock_irqsave(&bio_lock, bio_flags);
-
-		//while (bio_in_progress == 1) {
-                 //      schedule();
-               // }
-                //bio_in_progress = 1 ;
-
+	else /* Go ahead to do I/O */
 		push(&_io_jobs, job);
-	}
-	//	do_io(job);
-		
+
 	wake();
 }
 
@@ -1225,8 +1213,6 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
         for (i=0; i < cache_assoc ;    i++, index++) {
                 if (is_state(cache[index].state, VALID) ||
                     is_state(cache[index].state, RESERVED)) {
-//                       DPRINTK("VALID %llu - %llu - %llu" ,cache[index].block,block,block_in);
-//                       DPRINTK("Index %llu - %llu" ,index,block_ori);
 
                         if (cache[index].block == block_ori && 
 				cache[index].disk == disk) {
@@ -1284,119 +1270,6 @@ static int cache_lookup(struct cache_c *dmc, sector_t block_in,
                         1 == res ? "HIT" : (0 == res ? "MISS" : "WB NEEDED"));
         return res;
 }
-
-#if 0
-/*
- * Lookup a block in the cache.
- *
- * Return value:
- *  1: cache hit (cache_block stores the index of the matched block)
- *  0: cache miss but frame is allocated for insertion; cache_block stores the
- *     frame's index:
- *      If there are empty frames, then the first encounted is used.
- *      If there are clean frames, then the LRU clean block is replaced.
- *  2: cache miss and frame is not allocated; cache_block stores the LRU dirty
- *     block's index:
- *      This happens when the entire set is dirty.
- * -1: cache miss and no room for insertion:
- *      This happens when the entire set in transition modes (RESERVED or
- *      WRITEBACK).
- *
- */
-static int cache_lookup1(struct cache_c *dmc, sector_t block_in,
- 	                    sector_t *cache_block, int disk,int noalloc)
-{
-
-        sector_t block_ori = block_in;
-
-        struct ext_sector *blockst = (struct ext_sector*) &block_in;
-        blockst->disk = disk;
-        sector_t block = *(sector_t *)blockst;
-
-
-//	unsigned long set_number = hash_block(dmc, block);
-	block = block_ori;
-	unsigned long set_number = block_ori;
-
-	sector_t index;
-	int i, res;
-	unsigned int cache_assoc = dmc->assoc;
-	struct cacheblock *cache = dmc->cache;
-	int invalid = -1, oldest = -1, oldest_clean = -1;
-	unsigned long counter = ULONG_MAX, clean_counter = ULONG_MAX;
-
-
-	index=set_number * cache_assoc;
-//	index = block_ori ;
-
-	BUG_ON(index > dmc->size);
-/*
-	DPRINTK("BEFORE   INDEX NUL!!!!!!!!!!!!!!!!");
-	if(cache[index].state != 0)
-		DPRINTK("INDEX NUL!!!!!!!!!!!!!!!!");
-	DPRINTK("AFTER ---  INDEX NUL!!!!!!!!!!!!!!!!");
-*/		
-
-	for (i=0; i<cache_assoc; i++, index++) {
-		if (is_state(cache[index].state, VALID) ||
-		    is_state(cache[index].state, RESERVED)) {
-			if (cache[index].block == block_ori) {
-				*cache_block = index;
-				/* Reset all counters if the largest one is going to overflow */
-				if (dmc->counter == ULONG_MAX) cache_reset_counter(dmc);
-				cache[index].counter = ++dmc->counter;
-				break;
-			} else {
-				/* Don't consider blocks that are in the middle of copying */
-				if (!is_state(cache[index].state, RESERVED) &&
-				    !is_state(cache[index].state, WRITEBACK)) {
-					if (!is_state(cache[index].state, DIRTY) &&
-					    cache[index].counter < clean_counter) {
-						clean_counter = cache[index].counter;
-						oldest_clean = i;
-					}
-					if (cache[index].counter < counter) {
-						counter = cache[index].counter;
-						oldest = i;
-					}
-				}
-			}
-		} else {
-			if (-1 == invalid) invalid = i;
-		}
-	}
-
-	res = i < cache_assoc ? 1 : 0;
-	if (!res) { /* Cache miss */
-//  	        if (noalloc == 1) return 0;
-		if (invalid != -1) /* Choose the first empty frame */
-//			*cache_block = set_number * cache_assoc + invalid;
-			*cache_block = block_ori;
-		else if (oldest_clean != -1) /* Choose the LRU clean block to replace */
-//			*cache_block = set_number * cache_assoc + oldest_clean;
-			*cache_block = block_ori;
-		else if (oldest != -1) { /* Choose the LRU dirty block to evict */
-			res = 2;
-//			*cache_block = set_number * cache_assoc + oldest;
-			*cache_block = block_ori;
-		} else {
-			res = -1;
-		}
-	}
-
-	if (-1 == res)
-		DPRINTK("Cache lookup: Block %llu(%lu):%s",
-				(long long unsigned int)block, 
-				(long unsigned int)set_number, "NO ROOM");
-	else
-		DPRINTK("Cache lookup: Block %llu(%lu):%llu(%s)",
-				(long long unsigned int)block, 
-				(long unsigned int)set_number, 
-				(long long unsigned int)*cache_block,
-				1 == res ? "HIT" : (0 == res ? "MISS" : "WB NEEDED"));
-	return res;
-}
-#endif
 
 /*
  * Insert a block into the cache (in the frame specified by cache_block).
@@ -1615,12 +1488,6 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 			(long long unsigned int)bio->bi_sector, 
 			(unsigned int)job->nr_pages);
 
-        //while(cache[cache_block].status != READY){
-          //      schedule();
-	//}
-
-	//cache[cache_block].status = PENDING_READ;
-
 	while (1) {
 		set_current_state(TASK_UNINTERRUPTIBLE);
 
@@ -1636,192 +1503,9 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 
 
 	queue_job(job);
-	//do_pages(job);
-	//do_io(job);
 
 	return 0;
 }
-
-#if 0
-/*
- * Handle a read cache hit:
- *  fetch the necessary block from cache device;
- *  restore, do not do store, just jumpt directly to do_complete
- *  
- */
-static int cache_read_hit(struct cache_c *dmc, struct bio* bio,
-                               sector_t cache_block) {
-        struct cacheblock *cache = dmc->cache;
-        unsigned int offset, head, tail;
-        struct kcached_job *job;
-        sector_t request_block, left;
-        struct dm_io_region src;
-
-        offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
-        request_block = bio->bi_sector - offset;
-
-        if (cache[cache_block].state & VALID) {
-		DPRINTK("Hit Read been processed %llu->%llu",
-				(long long unsigned int)cache[cache_block].block, 
-				(long long unsigned int)request_block);
-	} else{
-		DPRINTK("Something is wrong here %llu at empty frame %llu",
-				(long long unsigned int)request_block, 
-				(long long unsigned int)cache_block);
-        //      BUG_ON(1);
-        }
-        src.bdev =  dmc->cache_dev->bdev;
-        src.sector = cache_block;
-        src.count = dmc->block_size;
-
-        job = mempool_alloc(_job_pool, GFP_NOIO);
-        job->dmc = dmc;
-        job->bio = bio;
-        job->src = src;
-        job->cacheblock = &dmc->cache[cache_block];
-
-//---------------------------------
-        head = to_bytes(offset);
-
-        left = (dmc->src_dev->bdev->bd_inode->i_size>>9) - request_block;
-        if (left < dmc->block_size) {
-                tail = to_bytes(left) - bio->bi_size - head;
-                job->src.count = left;
-                job->dest.count = left;
-        } else
-                tail = to_bytes(dmc->block_size) - bio->bi_size - head;
-
-        /* Requested block is aligned with a cache block */
-        if (0 == head && 0 == tail)
-                job->nr_pages= 0;
-        else /* Need new pages to store extra data */
-                job->nr_pages = dm_div_up(head, PAGE_SIZE) + dm_div_up(tail, PAGE_SIZE);
-        job->rw = READ; /* Fetch data from the source device */
-        job->hit = 1;
-/*
-        while(cache[cache_block].status != READY){
-               schedule();
-        }
-        cache[cache_block].status = PENDING_READ;
-*/
-	while (1) {
-		set_current_state(TASK_UNINTERRUPTIBLE);
-
-		if (!atomic_read(&cache[cache_block].status))
-			break;
-		DPRINTK("WAIT for %llu - %llu ",
-			(long long unsigned int)cache_block,
-			(long long unsigned int)request_block);
-		io_schedule();
-	}
-	atomic_set(&cache[cache_block].status,1);
-	set_current_state(TASK_RUNNING);
-
-       // BUG_ON(job->nr_pages != 0); // should be aligned
-        DPRINTK("Queue job for %llu (need %u pages)",
-                (long long unsigned int)bio->bi_sector, job->nr_pages);
-        queue_job(job);
-
-        return 0;
-}
-
-/*
- * Handle a write cache hit:
- */
-static int cache_write_cache(struct cache_c *dmc, struct bio* bio, sector_t cache_block,
-                                int hit, int writethrough) {
-        struct cacheblock *cache = dmc->cache;
-        unsigned int offset, head, tail;
-        struct kcached_job *job;
-        sector_t request_block, left;
-        struct dm_io_region dest;
-
-        offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
-        request_block = bio->bi_sector - offset;
-
-        if (cache[cache_block].state & VALID) {
-                DPRINTK("WRITE THROUGH MISS .VALID  %llu->%llu",
-                        (long long unsigned int)cache[cache_block].block, 
-			(long long unsigned int)request_block);
-                dmc->replace++;
-        } else DPRINTK("WRITE THROUG MISS INVALID request: %llu cache block %llu",
-                (long long unsigned int)request_block, 
-		(long long unsigned int)cache_block);
-
-        /* Write delay */
-        //cache_insert(dmc, request_block, cache_block); /* Update metadata first */
-        //set_state(cache[cache_block].state, DIRTY);
-        //dmc->dirty_blocks++;
-//------------job-------------------------
-//      job = new_kcached_job(dmc, bio, request_block, cache_block);
-
-        if(writethrough)
-                dest.bdev = dmc->src_dev->bdev;
-        else
-                dest.bdev = dmc->cache_dev->bdev;
-
-        dest.sector = bio->bi_sector;
-
-        dest.count = dmc->block_size;
-        job = mempool_alloc(_job_pool, GFP_NOIO);
-        job->dmc = dmc;
-        job->bio = bio;
-        job->dest = dest;
-        job->cacheblock = &dmc->cache[cache_block];
-        job->hit = hit ;
-
-//----------------------------------------------
-        head = to_bytes(offset);
-        left = (dmc->src_dev->bdev->bd_inode->i_size>>9) - request_block;
-        if (left < dmc->block_size) {
-                tail = to_bytes(left) - bio->bi_size - head;
-                job->src.count = left;
-                job->dest.count = left;
-        } else
-                tail = to_bytes(dmc->block_size) - bio->bi_size - head;
-
-        if (0 == head && 0 == tail) { /* Requested is aligned with a cache block */
-                job->nr_pages = 0;
-                job->rw = WRITE;
-        } else if (head && tail){ /* Special case: need to pad both head and tail */
-                job->nr_pages = dm_div_up(to_bytes(job->src.count), PAGE_SIZE);
-                job->rw = READ;
-        } else {
-                if (head) { /* Fetch only head */
-                        job->src.count = to_sector(head);
-                        job->nr_pages = dm_div_up(head, PAGE_SIZE);
-                } else { /* Fetch only tail */
-                        job->src.sector = bio->bi_sector + to_sector(bio->bi_size);
-                        job->src.count = to_sector(tail);
-                        job->nr_pages = dm_div_up(tail, PAGE_SIZE);
-                }
-                job->rw = READ;
-        }
-/*
-        while(cache[cache_block].status != READY){
-                schedule();
-        }
-        cache[cache_block].status = PENDING_WRITE;
-*/
-	while (1) {
-		set_current_state(TASK_UNINTERRUPTIBLE);
-
-		if (!atomic_read(&cache[cache_block].status))
-			break;
-		DPRINTK("WAIT for %llu - %llu ",
-			(long long unsigned int) cache_block,
-			(long long unsigned int) request_block);
-		io_schedule();
-	}
-	atomic_set(&cache[cache_block].status,1);
-	set_current_state(TASK_RUNNING);
-
-        queue_job(job);
-
-        return 0;
-}
-#endif
-
 
 /*
  * Handle a write cache miss:
@@ -1902,44 +1586,19 @@ static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block
 		return cache_write_miss(dmc, bio, cache_block,disk);
 }
 
-
-/*
-static int get_disk_identifier (struct cache_c *dmc)
-{
- 	int i=0, ret = -1;
-	DPRINTK("DISK-IDENTIFIER SRC:%llu 1:%llu",
-			(long long unsigned int)dmc->src_dev->bdev->bd_dev,
-			(long long unsigned int)dev_arr[i]->bdev->bd_dev );
- 	for (i = 0 ; i < dm_dev_identifier ; i++){
- 		if(dev_arr[i]->bdev->bd_dev == dmc->src_dev->bdev->bd_dev)
- 			ret = i;
- 	}
- 	DPRINTK("SOURCE: %llu ret: %d total: %d",
-		(long long unsigned int)dmc->src_dev->bdev->bd_dev,ret,dm_dev_identifier);
-	BUG_ON(ret == -1);
- 	return ret;
-}*/
-
 static int virtual_cache_map(struct bio *bio)
 {
 	int i = 0, ret = -1;
 
-//	DPRINTK("virtual cache map %d : bio dev: %llu:%llu",
-//			dm_dev_identifier,(
-//				long long unsigned int)bio->bi_bdev->bd_dev,
-//				(long long unsigned int)virtual_mapping[0].vcache_dev);
-	for (i=0; i < dm_dev_identifier ; i++)
+	for (i=0; i < ctn_dm_dev ; i++)
 	{
-//		DPRINTK("LOOP  ---> %llu:%llu",
-//				(long long unsigned int)bio->bi_bdev->bd_dev,
-//				(long long unsigned int)virtual_mapping[i].vcache_dev);
-		if(virtual_mapping[i].vcache_dev == bio->bi_bdev->bd_dev)
+		if(virtual_mapping[i].vcache_dev == bio->bi_bdev->bd_dev 
+				&& virtual_mapping[i].active == 1)
 			ret = i;
 	}
 	if(ret == -1)
 		DMERR("Virtual cache not found %llu",
 				(long long unsigned int)bio->bi_bdev->bd_dev);
-//	DPRINTK("virtual cache map return %d",ret);
 	return ret;
 }
 /****************************************************************************
@@ -1954,12 +1613,7 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 {
 //	struct cache_c *dmc = (struct cache_c *) ti->private;
 	struct cache_c *dmc = &shared_cache;
-/*
-	//int pos = virtual_cache_map(bio,dmc);
-	//bio->bi_bdev = virtual_mapping[virtual_cache_map(bio)].src_dev->bdev;
-	bio->bi_bdev = dmc->src_dev->bdev;
-	return 1;
-*/
+
 	sector_t request_block, cache_block = 0, offset;
 	int res;
 	int noalloc = 0;
@@ -2197,17 +1851,12 @@ static int dump_metadata(struct cache_c *dmc) {
 
 static sector_t calculate_offset( int num_devices)
 {
-	sector_t ret = 0;
-	int i;
-		DPRINTK("start Calculate offset: %d",num_devices);
+	DPRINTK("start Calculate offset: %d",num_devices);
 
-	for (i=0 ; i < num_devices ; i++ ){
-		DPRINTK("Calculate offset: %d",num_devices);
-		ret = ret + virtual_mapping[i].dev_size;
-	}
-		DPRINTK("finish Calculate offset: %llu",(unsigned long long)ret);
-
-	return ret;
+	if(num_devices == 0)
+		return 0;
+	else
+		return (virtual_mapping[num_devices-1].dev_offset + virtual_mapping[num_devices-1].dev_size);
 }
 /*
  * Construct a cache mapping.
@@ -2230,7 +1879,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int r = -EINVAL;
 	struct mapped_device *mapped_dev;
 	struct dm_dev *virtual_cache;
-
+	struct dm_dev_internal *dd;
 
 	if (argc < 2) {
 		ti->error = "dm-cache: Need at least 2 arguments (src dev and cache dev)";
@@ -2248,24 +1897,22 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	//Adding source device
 	r = dm_get_device(ti, argv[0],
-			dm_table_get_mode(ti->table), &virtual_mapping[dm_dev_identifier].src_dev);
+			dm_table_get_mode(ti->table), &virtual_mapping[ctn_dm_dev].src_dev);
 //			dm_table_get_mode(ti->table), &dmc->src_dev);
 
-//	virtual_mapping[dm_dev_identifier].src_dev = dmc->src_dev;
-	virtual_mapping[dm_dev_identifier].ti = ti;
-//	dmc->src_dev = dmc->src_devs[dm_dev_identifier];
+	virtual_mapping[ctn_dm_dev].ti = ti;
 	if (r) {
 		ti->error = "dm-cache: Source device lookup failed";
 		goto bad1;
 	}else {
-		DPRINTK("Registering device %s:%llu",virtual_mapping[dm_dev_identifier].src_dev->name,
-				(long long unsigned int)virtual_mapping[dm_dev_identifier].src_dev->bdev->bd_dev);
-	//	dev_arr[dm_dev_identifier] = dmc->src_devs[dm_dev_identifier];
+		DPRINTK("Registering device %s:%llu",virtual_mapping[ctn_dm_dev].src_dev->name,
+				(long long unsigned int)virtual_mapping[ctn_dm_dev].src_dev->bdev->bd_dev);
+	//	dev_arr[ctn_dm_dev] = dmc->src_devs[ctn_dm_dev];
 	}
 
 	//Calculate Size and offset of the device
-	virtual_mapping[dm_dev_identifier].dev_size = ti->len;
-	virtual_mapping[dm_dev_identifier].dev_offset = calculate_offset(dm_dev_identifier);
+	virtual_mapping[ctn_dm_dev].dev_size = ti->len;
+	virtual_mapping[ctn_dm_dev].dev_offset = calculate_offset(ctn_dm_dev);
 
 	//Adding virtual cache devices
 	mapped_dev = dm_table_get_md(ti->table);
@@ -2276,29 +1923,47 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "dm-cache: virtual cache device lookup failed";
 		goto bad1;
 	}else {
-		virtual_mapping[dm_dev_identifier].vcache_dev = virtual_cache->bdev->bd_dev;
+		virtual_mapping[ctn_dm_dev].vcache_dev = virtual_cache->bdev->bd_dev;
 		
 		DPRINTK("Registering %d device %s:%llu",
-				dm_dev_identifier,
+				ctn_dm_dev,
 				dm_device_name(mapped_dev),
-				(long long unsigned int)virtual_mapping[dm_dev_identifier].vcache_dev);
+				(long long unsigned int)virtual_mapping[ctn_dm_dev].vcache_dev);
 		dm_put_device(ti, virtual_cache);
-		dm_dev_identifier++;
+		virtual_mapping[ctn_dm_dev].active = 1;
+		ctn_dm_dev++;
 	}
 
 
 	//Adding global cache device
 	if(init_flag == 0) {
-		r = dm_get_device(ti, argv[1],
-				dm_table_get_mode(ti->table), &dmc->cache_dev);
+
+		DPRINTK("Registering %s",argv[1]);
+
+		dd =  kmalloc(sizeof(*dd), GFP_KERNEL);
+		dd->dm_dev.mode = dm_table_get_mode(ti->table);		
+		dd->dm_dev.bdev = lookup_bdev(argv[1]);
+
+		r = blkdev_get( dd->dm_dev.bdev , dd->dm_dev.mode, NULL);
 		if (r) {
 			ti->error = "dm-cache: Cache device lookup failed";
+			kfree(dd);
 			goto bad2;
 		}else{
+
+			format_dev_t(dd->dm_dev.name, dd->dm_dev.bdev->bd_dev);
+			atomic_set(&dd->count, 0);
+			atomic_inc(&dd->count);
+
+			dmc->cache_dev = &dd->dm_dev;
+
 			DPRINTK("Registering device %s:%llu",argv[1],
 					(long long unsigned int)dmc->cache_dev->bdev->bd_dev);
 		}
-	}
+		//		r = dm_get_device( ti, argv[1],
+		//				dm_table_get_mode(ti->table), &dmc->cache_dev);
+
+	}	
 
 	if(dmc->io_client == NULL)
 		dmc->io_client = dm_io_client_create();
@@ -2345,6 +2010,17 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			goto bad6;
 		}
 	}else{
+
+	DMINFO("Allocate :%d  (%luB per) mem for %llu-entry cache" \
+	       "associativity:%u, block size:%u " \
+	       "sectors(%uKB), %s) table %llu",ctn_dm_dev,
+		(unsigned long) sizeof(struct cacheblock),
+		(unsigned long long) dmc->size,
+	       	dmc->assoc, dmc->block_size,
+	       	dmc->block_size >> (10-SECTOR_SHIFT),
+		dmc->write_policy ? "write-back" : "write-through",
+		(unsigned long long)ti->table);
+		
 		goto init_sc;
 	}
 
@@ -2428,7 +2104,6 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	} else
 		dmc->write_policy = DEFAULT_WRITE_POLICY;
 
-	//dmc->size = 6291456ull;
 	order = dmc->size * sizeof(struct cacheblock);
 	localsize = data_size >> 11;
 
@@ -2472,7 +2147,7 @@ init:	/* Initialize the cache structs */
 init_sc:
 	ti->split_io = dmc->block_size;
 //	ti->private = dmc;
-	ti->private = &virtual_mapping[dm_dev_identifier-1];
+	ti->private = &virtual_mapping[ctn_dm_dev-1];
 
 	init_flag = 1;
 	return 0;
@@ -2521,16 +2196,19 @@ static void cache_flush(struct cache_c *dmc)
  */
 static void cache_dtr(struct dm_target *ti)
 {
-//	struct cache_c *dmc = (struct cache_c *) ti->private;
+	//	struct cache_c *dmc = (struct cache_c *) ti->private;
 	struct cache_c *dmc = &shared_cache;
-//	struct dm_dev *virtual_cache = (struct dm_dev *) ti->private;
+	//	struct dm_dev *virtual_cache = (struct dm_dev *) ti->private;
 	struct v_map *map_dev = (struct v_map *) ti->private;
+
+	struct dm_dev_internal *dd;
+	dd = container_of(dmc->cache_dev, struct dm_dev_internal,dm_dev);
 
 	DPRINTK("DTR %s",map_dev->src_dev->name);
 
 	if (dmc->dirty_blocks > 0) cache_flush(dmc);
 
-	if(dm_dev_identifier == 1){
+	if(idx_dm_dev == 1){
 		kcached_client_destroy(dmc);
 
 		dm_kcopyd_client_destroy(dmc->kcp_client);
@@ -2546,17 +2224,15 @@ static void cache_dtr(struct dm_target *ti)
 		dump_metadata(dmc); /* Always dump metadata to disk before exit */
 		vfree((void *)dmc->cache);
 		dm_io_client_destroy(dmc->io_client);
-		dm_put_device(ti, dmc->cache_dev);
+
+		blkdev_put(dd->dm_dev.bdev , dd->dm_dev.mode);
 		init_flag = 0;
 	}
-	DPRINTK("Destroying devices!");
 
-		//dm_put_device(ti,virtual_mapping[0].src_dev );
-//		dm_put_device(ti, dmc->src_dev);
-//		dm_put_device(ti,virtual_cache);
-		dm_put_device(map_dev->ti,map_dev->src_dev);
-	
-	dm_dev_identifier--;
+	map_dev->active = 0;
+	dm_put_device(map_dev->ti,map_dev->src_dev);
+
+	idx_dm_dev--;
 	//kfree(dmc);
 }
 
