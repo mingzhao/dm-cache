@@ -2061,7 +2061,6 @@ static void cache_flush(struct cache_c *dmc, int disk)
 	}
 }
 
-
 static int flush_virtual_cache ( int disk )
 {
 	struct cache_c *dmc = shared_cache;
