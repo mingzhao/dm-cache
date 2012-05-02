@@ -1,1 +1,0 @@
-cmd_/root/dm-cache-3.0.8/dm-cache.ko := ld -r -m elf_x86_64 -T /usr/src/linux-3.0.8/scripts/module-common.lds --build-id  -o /root/dm-cache-3.0.8/dm-cache.ko /root/dm-cache-3.0.8/dm-cache.o /root/dm-cache-3.0.8/dm-cache.mod.o
