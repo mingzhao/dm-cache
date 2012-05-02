@@ -22,7 +22,6 @@ struct io_req {
 int main() {
 	struct io_req req = {
 		.sector = 2,
-	//	.rw = READ,
 		.rw = WRITE,
 		.size = 512,
 		.major = 8,
