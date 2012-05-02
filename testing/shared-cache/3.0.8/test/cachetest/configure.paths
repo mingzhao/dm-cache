@@ -1,0 +1,5 @@
+CONFIG_INSTALLROOT="/usr/local/"
+CONFIG_BINPATH="/usr/local/bin"
+CONFIG_LIBPATH="/usr/local/lib"
+CONFIG_CONFPATH="/usr/local/etc/conf"
+CONFIG_INCLUDEPATH="/usr/local/include"
