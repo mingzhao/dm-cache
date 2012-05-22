@@ -88,7 +88,6 @@
 #define clear_state(x, y)	(x &= ~y)
 #define put_state(x, y)		(x = y)
 
-#define MESG_STR(x) x, sizeof(x)
 /*
  * Validations
  */
@@ -1706,7 +1705,7 @@ static int get_vm_index(char *vm_identifier){
 
 	for (i=0; i < ctn_dm_dev ; i ++)
 	{
-		if (!strnicmp(virtual_mapping[i].vm_id , MESG_STR(vm_identifier))) {
+		if (strcmp(virtual_mapping[i].vm_id , vm_identifier) == 0) {
 			if(is_state(virtual_mapping[i].state,ENABLED)){
 				return -1;
 			}else if(is_state(virtual_mapping[i].state,DISABLED)){
@@ -2161,13 +2160,13 @@ static int cache_message(struct dm_target *ti, unsigned int argc, char **argv)
 	if (argc != 1)
 		goto error;
 
-	if (!strnicmp(argv[0], MESG_STR("flush"))) {	
+	if (strcmp(argv[0], "flush")==0) {	
 		return flush_virtual_cache ( map_dev->identifier ); 
-	}else if (!strnicmp(argv[0], MESG_STR("disable"))) {	
+	}else if (strcmp(argv[0],"disable")==0) {	
 		put_state(map_dev->state, DISABLED);
 		DPRINTK("DISABLING! %s,%d",map_dev->vm_id,map_dev->state);
 		return flush_virtual_cache ( map_dev->identifier ); 
-	}else if (!strnicmp(argv[0], MESG_STR("enable"))) {	
+	}else if (strcmp(argv[0], "enable")==0) {	
 		put_state(map_dev->state, ENABLED);
 		DPRINTK("ENABLING! %s,%d",map_dev->vm_id,map_dev->state);
 		return 1;
