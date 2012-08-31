@@ -1,0 +1,76 @@
+#!/bin/bash
+
+function create {
+insmod dm-cache.ko
+echo 0 6291456 cache /dev/dm-cache/lv-node1-disk  /dev/sda6 0 8 2097152 1 0 lv-node1 | dmsetup create cache1
+echo 0 6291456 cache /dev/dm-cache/lv-node2-disk  /dev/sda6 0 8 2097152 1 0 lv-node2 | dmsetup create cache2
+#echo 0 6291456 cache /dev/dm-cache/lv-node1-disk  /dev/sdb 0 1 16777216 1 0 | dmsetup create cache1
+#echo 0 6291456 cache /dev/dm-cache/lv-node2-disk  /dev/sdb 0 1 16777216 1 0 | dmsetup create cache2
+#echo 0 6291456 cache /dev/dm-cache/lv-node3-disk  /dev/sdb 0 1 16777216 1 0 | dmsetup create cache3
+#echo 0 6291456 cache /dev/dm-cache/lv-node4-disk  /dev/sdb 0 1 16777216 1 0 | dmsetup create cache4
+#echo 0 8388608 cache /dev/dm-cache/lv-node10-disk  /dev/sdb 0 8 16777216 1 0 | dmsetup create cache10
+}
+
+function create2 {
+insmod dm-cache.ko
+echo 0 6291456 cache /dev/dm-cache/lv-node2-disk  /dev/sda6 0 1 4194304  1 0 | dmsetup create cache2
+#echo 0 6291456 cache /dev/dm-cache/lv-node2-disk  /dev/sda6 0 8 131072  1 0 | dmsetup create cache2
+}
+
+function create1 {
+insmod dm-cache.ko
+echo 0 6291456 cache /dev/dm-cache/lv-node1-disk  /dev/sda6 0 1 4194304  1 0 | dmsetup create cache1
+#echo 0 6291456 cache /dev/iscsi-client/VM1  /dev/sdb 0 1 4194304  1 0 | dmsetup create cache1
+#echo 0 6291456 cache /dev/dm-cache/lv-node2-disk  /dev/sda6 0 8 131072  1 0 | dmsetup create cache2
+}
+
+function linear {
+insmod dm-linear.ko
+echo 0 6291456 linear /dev/dm-cache/lv-node2-disk 0 | dmsetup create cache2
+}
+
+
+function mounting {
+mount /dev/mapper/cache10 /mnt/cache10
+#mount /dev/mapper/cache1 /mnt/cache1
+mount
+}
+function start_cache {
+	create
+	mounting
+}
+function destroy {
+
+umount /dev/mapper/cache10 
+	dmsetup remove cache10
+	dmsetup remove cache4	
+	dmsetup remove cache3	
+	dmsetup remove cache2	
+	dmsetup remove cache1
+	rmmod dm_cache
+}
+
+case "$1" in
+
+	start)
+		start_cache
+		;;
+	create)
+		create
+		;;
+	destroy)
+		destroy
+		;;
+	cache2)
+		create2
+		;;
+	cache1)
+		create1
+		;;
+	linear)
+		linear
+		;;
+	*)
+		echo "$0 create/destroy"
+		;;
+esac

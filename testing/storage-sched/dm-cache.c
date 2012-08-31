@@ -27,7 +27,9 @@
 
 #include <asm/atomic.h>
 #include <asm/checksum.h>
+#include <asm/div64.h>
 #include <linux/module.h>
+#include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/blkdev.h>
@@ -42,7 +44,7 @@
 #include <linux/dm-io.h>
 #include <linux/dm-kcopyd.h>
 
-#define DMC_DEBUG 0
+#define DMC_DEBUG 1
 
 #define DM_MSG_PREFIX "cache"
 #define DMC_PREFIX "dm-cache: "
@@ -81,7 +83,7 @@
 
 #define HASH		0	/* Use hash_long */
 #define UNIFORM		1	/* Evenly distributed */
-#define DEFAULT_HASHFUNC HASH
+#define DEFAULT_HASHFUNC UNIFORM
 
 #define is_state(x, y)		(x & y)
 #define set_state(x, y)		(x |= y)
@@ -117,6 +119,13 @@ struct v_map {
 	int state;
 	sector_t dev_size;
 	sector_t dev_offset;
+
+        /*Edited by Rachel Chavez Sanchez*/
+	unsigned long long block_counter;
+	unsigned long long max_number_blocks;
+	unsigned long long total_number_blocks;
+        unsigned long long same_disk;
+        unsigned long long share;
 
 	dev_t vcache_dev;
 	struct dm_dev *src_dev;
@@ -155,7 +164,9 @@ struct cache_c {
 
 	/* Stats */
 	unsigned long reads;		/* Number of reads */
+        unsigned long read_miss;
 	unsigned long writes;		/* Number of writes */
+        unsigned long write_miss;
 	unsigned long cache_hits;	/* Number of cache hits */
 	unsigned long replace;		/* Number of cache replacements */
 	unsigned long writeback;	/* Number of replaced dirty blocks */
@@ -1025,6 +1036,7 @@ static int validate_sector(sector_t sector_source, sector_t sector_cache,struct 
 
         return 0;
 }
+
 static int validate_fetch(sector_t sector_source, struct page *fetch_page, int vdisk)
 {
         int size = 512;
@@ -1078,8 +1090,7 @@ static int validate_fetch(sector_t sector_source, struct page *fetch_page, int v
  *      WRITEBACK).
  *
  */
-static int cache_lookup(struct cache_c *dmc, sector_t block,
-		sector_t *cache_block, int disk)
+static int cache_lookup(struct cache_c *dmc, sector_t block, sector_t *cache_block, int disk)
 {
 	unsigned long set_number;
 	sector_t __block, index, block_ori;
@@ -1094,62 +1105,89 @@ static int cache_lookup(struct cache_c *dmc, sector_t block,
 
 	set_number = hash_block(dmc, __block);
 
-	index=set_number * cache_assoc;
+	index = set_number * cache_assoc;
 
-	for (i=0; i<cache_assoc; i++, index++) {
-		if (is_state(cache[index].state, VALID) ||
-				is_state(cache[index].state, RESERVED)) {
-
-			if (cache[index].block == block_ori && 
-					cache[index].disk == disk) {
-				*cache_block = index;
+	for ( i = 0; i < cache_assoc; i++, index++) 
+	{
+		if ( is_state( cache[index].state, VALID ) || is_state( cache[index].state, RESERVED )) 
+		{
+			if (cache[index].block == block_ori && 	cache[index].disk == disk) 
+			{
+				*cache_block = index;				
 				/* Reset all counters if the largest one is going to overflow */
-				if (dmc->counter == ULONG_MAX) cache_reset_counter(dmc);
+				if (dmc->counter == ULONG_MAX)
+				{ 
+					cache_reset_counter(dmc);
+				}				
 				cache[index].counter = ++dmc->counter;
 				break;
-			} else {
+			}
+			else
+			{
+                            /*Edited by Rachel Chavez Sanchez*/
 				/* Don't consider blocks that are in the middle of copying */
-				if (!is_state(cache[index].state, RESERVED) &&
-						!is_state(cache[index].state, WRITEBACK)) {
-					if (!is_state(cache[index].state, DIRTY) &&
-							cache[index].counter < clean_counter) {
-						clean_counter = cache[index].counter;
-						oldest_clean = i;
+				if (!is_state(cache[index].state, RESERVED) && !is_state(cache[index].state, WRITEBACK)) 
+				{
+                                    if(virtual_mapping[disk].block_counter < virtual_mapping[disk].max_number_blocks || cache[index].disk == disk)
+                                    {
+					if (!is_state(cache[index].state, DIRTY) && cache[index].counter < clean_counter)
+					{
+                                            clean_counter = cache[index].counter;
+                                            oldest_clean = i;
 					}
-					if (cache[index].counter < counter) {
-						counter = cache[index].counter;
-						oldest = i;
+					if (cache[index].counter < counter) 
+					{						
+                                            counter = cache[index].counter;
+                                            oldest = i;
 					}
+                                    }
 				}
 			}
-		} else {
+		}
+		else 
+		{
+                    if(virtual_mapping[disk].block_counter < virtual_mapping[disk].max_number_blocks)
+                    {
 			if (-1 == invalid) invalid = i;
+                    }
 		}
 	}
 
 	res = i < cache_assoc ? 1 : 0;
-	if (!res) { /* Cache miss */
-		if (invalid != -1) /* Choose the first empty frame */
+	if (!res) /* Cache miss */
+	{
+            /*Edited by Rachel Chavez Sanchez*/
+		if (invalid != -1)/* Choose the first empty frame */
+		{ 
 			*cache_block = set_number * cache_assoc + invalid;
-		else if (oldest_clean != -1) /* Choose the LRU clean block to replace */
+		}
+		else if (oldest_clean != -1)/* Choose the LRU clean block to replace */
+		{ 
 			*cache_block = set_number * cache_assoc + oldest_clean;
-		else if (oldest != -1) { /* Choose the LRU dirty block to evict */
+		}
+		else if (oldest != -1) /* Choose the LRU dirty block to evict */
+		{ 
 			res = 2;
 			*cache_block = set_number * cache_assoc + oldest;
-		} else {
+		} 
+		else 
+		{
 			res = -1;
 		}
 	}
 
 	if (-1 == res)
-		DPRINTK("Cache lookup: Block %llu(%lu):%s",
-				block, set_number, "NO ROOM");
+	{
+		DPRINTK("Cache lookup: Block %llu(%lu):%s", block, set_number, "NO ROOM");
+	}
 	else
-                DPRINTK("BOOTING--> Cache lookup: Block %llu(%lu):%llu(%s)",
-                        block, set_number, *cache_block,
-                        1 == res ? "HIT" : (0 == res ? "MISS" : "WB NEEDED"));
-        return res;
+	{
+		DPRINTK("BOOTING--> Cache lookup: Block %llu(%lu):%llu(%s)", block, set_number, *cache_block, 
+		(1 == res ? "HIT" : (0 == res ? "MISS" : "WB NEEDED")));
+        }
+    return res;
 }
+
 
 /*
  * Insert a block into the cache (in the frame specified by cache_block).
@@ -1198,7 +1236,8 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 
 	dmc->cache_hits++;
 
-	if (bio_data_dir(bio) == READ) { /* READ hit */
+	if (bio_data_dir(bio) == READ) /* READ hit */
+        {
 		bio->bi_bdev = dmc->cache_dev->bdev;
 		bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
 
@@ -1216,16 +1255,20 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 
 		spin_unlock(&cache[cache_block].lock);
 		return 0;
-	} else { /* WRITE hit */
-		if (dmc->write_policy == WRITE_THROUGH) { /* Invalidate cached data */
-			if (is_state(cache[cache_block].state, VALID)) {
+	} 
+        else /* WRITE hit */
+        {
+		if (dmc->write_policy == WRITE_THROUGH) /* Invalidate cached data */
+                {
+			if (is_state(cache[cache_block].state, VALID))
+                        {
 				cache_invalidate(dmc, cache_block);
 				bio->bi_bdev = virtual_mapping[virtual_cache_map(bio)].src_dev->bdev;
 				return 1;
 			}
-				set_state(cache[cache_block].state,WRITETHROUGH);
-				bio_list_add(&cache[cache_block].bios, bio);
-				return 0;
+                        set_state(cache[cache_block].state,WRITETHROUGH);
+                        bio_list_add(&cache[cache_block].bios, bio);
+                        return 0;
 		}
 
 		/* Write delay */
@@ -1316,6 +1359,25 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
         } else DPRINTK("Insert block %llu at empty frame %llu",
                 request_block, cache_block);
 
+        if(cache[cache_block].disk != disk)
+        {
+            virtual_mapping[disk].block_counter++;
+            if(cache[cache_block].disk > -1)
+            {
+                virtual_mapping[cache[cache_block].disk].block_counter--;
+                DPRINTK("RACHEL: DISK %d increment DISK %d decrement cache_read_miss\n", disk, cache[cache_block].disk);
+            }
+            else
+            {
+                DPRINTK("RACHEL: DISK %d increment DISK %d INVALID cache_read_miss\n", disk, cache[cache_block].disk);
+            }
+        }
+        else
+        {
+            virtual_mapping[cache[cache_block].disk].same_disk++;
+            DPRINTK("RACHEL: DISKs are EQUAL %d = %d cache_read_miss\n", disk, cache[cache_block].disk);
+        }
+
 	cache_insert(dmc, request_block, cache_block, disk); /* Update metadata first */
 
 	job = new_kcached_job(dmc, bio, request_block, cache_block);
@@ -1370,7 +1432,8 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 	struct kcached_job *job;
 	sector_t request_block, left;
 
-	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
+	if (dmc->write_policy == WRITE_THROUGH) /* Forward request to source */
+        {
 		bio->bi_bdev = virtual_mapping[virtual_cache_map(bio)].src_dev->bdev;
 		return 1;
 	}
@@ -1378,15 +1441,39 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
 	request_block = bio->bi_sector - offset;
 
-	if (cache[cache_block].state & VALID) {
-		DPRINTK("Replacing %llu->%llu",
-		        cache[cache_block].block, request_block);
+	if (cache[cache_block].state & VALID)
+        {
+            DPRINTK("Replacing %llu->%llu",
+		    cache[cache_block].block, request_block);
 		dmc->replace++;
-	} else DPRINTK("Insert block %llu at empty frame %llu",
+	} else
+        {
+            DPRINTK("Insert block %llu at empty frame %llu",
 		request_block, cache_block);
+        }
 
-	/* Write delay */
+        if(cache[cache_block].disk != disk)
+        {
+            virtual_mapping[disk].block_counter++;
+            if(cache[cache_block].disk > -1)
+            {
+                virtual_mapping[cache[cache_block].disk].block_counter--;
+                DPRINTK("RACHEL: DISK %d increment DISK %d decrement cache_write_miss\n", disk, cache[cache_block].disk);
+            }
+            else
+            {
+                DPRINTK("RACHEL: DISK %d increment DISK %d INVALID cache_write_miss\n", disk, cache[cache_block].disk);
+            }
+        }
+        else
+        {
+            virtual_mapping[cache[cache_block].disk].same_disk++;
+            DPRINTK("RACHEL: DISKs are EQUAL %d = %d cache_write_miss\n", disk, cache[cache_block].disk);
+        }
+
+        /* Write delay */
 	cache_insert(dmc, request_block, cache_block,disk); /* Update metadata first */
+
 	set_state(cache[cache_block].state, DIRTY);
 	dmc->dirty_blocks++;
 
@@ -1425,11 +1512,18 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 }
 
 /* Handle cache misses */
-static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block, int disk) {
+static int cache_miss(struct cache_c *dmc, struct bio* bio, sector_t cache_block, int disk)
+{
 	if (bio_data_dir(bio) == READ)
-		return cache_read_miss(dmc, bio, cache_block,disk);
+        {
+            dmc->read_miss++;
+            return cache_read_miss(dmc, bio, cache_block,disk);
+        }
 	else
-		return cache_write_miss(dmc, bio, cache_block,disk);
+        {
+            dmc->write_miss++;
+            return cache_write_miss(dmc, bio, cache_block,disk);
+        }
 }
 
 static int virtual_cache_map(struct bio *bio)
@@ -1472,25 +1566,36 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
                 "READ":"READA"), bio->bi_sector, request_block, offset,
                 bio->bi_size);
 
-	if (bio_data_dir(bio) == READ) dmc->reads++;
-	else dmc->writes++;
+	if (bio_data_dir(bio) == READ) 
+        {
+            dmc->reads++;
+        }
+	else 
+        {
+            dmc->writes++;
+        }
 
 	disk = virtual_cache_map(bio);	
 
-	if(is_state(virtual_mapping[disk].state,ENABLED)){
-		res = cache_lookup(dmc, request_block, &cache_block,disk);
+	if(is_state(virtual_mapping[disk].state, ENABLED))
+        {
+		res = cache_lookup(dmc, request_block, &cache_block, disk);
 		if (1 == res)  /* Cache hit; server request from cache */
-			return  cache_hit(dmc, bio, cache_block);
+                {
+                    return  cache_hit(dmc, bio, cache_block);
+                }
 		else if (0 == res) /* Cache miss; replacement block is found */
-			return  cache_miss(dmc, bio, cache_block,disk);
-		else if (2 == res) { /* Entire cache set is dirty; initiate a write-back */
-			write_back(dmc, cache_block, 1);
-			dmc->writeback++;
+                {
+                    return  cache_miss(dmc, bio, cache_block, disk);
+                }
+		else if (2 == res) /* Entire cache set is dirty; initiate a write-back */
+                {
+                    write_back(dmc, cache_block, 1);
+                    dmc->writeback++;
 		}
 	}
 	/* Forward to source device */
 	bio->bi_bdev = virtual_mapping[virtual_cache_map(bio)].src_dev->bdev;
-
 	return 1;
 }
 
@@ -1818,6 +1923,11 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		populate_vm_mapping(idx_mapping,ti->len);
 	put_state(virtual_mapping[idx_mapping].state, ENABLED);
 
+        /*Edited by Rachel Chavez Sanchez*/
+	virtual_mapping[idx_mapping].block_counter = 0;
+        virtual_mapping[idx_mapping].share = 0;
+        virtual_mapping[idx_mapping].same_disk = 0;
+
 	/* Adding global cache device */
 	if(init_flag == 0) {
 		DPRINTK("Registering %s",argv[1]);
@@ -1895,7 +2005,11 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 				dmc->write_policy ? "write-back" : "write-through",
 				(unsigned long long)ti->table);
 
-		goto init_sc;
+                /*Edited by Rachel Chavez Sanchez*/
+                virtual_mapping[idx_mapping].total_number_blocks = virtual_mapping[idx_mapping-1].total_number_blocks;
+                virtual_mapping[idx_mapping].max_number_blocks = virtual_mapping[idx_mapping-1].total_number_blocks;
+
+                goto init_sc;
 	}
 
 	if (argc >= 4) {
@@ -1927,10 +2041,16 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			goto bad6;
 		}
 	} else
-		dmc->size = DEFAULT_CACHE_SIZE;
+        {
+            dmc->size = DEFAULT_CACHE_SIZE;
+        }
 	localsize = dmc->size;
 	dmc->bits = ffs(dmc->size) - 1;
 
+        /*Edited by Rachel Chavez Sanchez*/
+	virtual_mapping[idx_mapping].total_number_blocks = cache_size;
+        virtual_mapping[idx_mapping].max_number_blocks = cache_size;
+        
 	if (argc >= 6) {
 		if (sscanf(argv[5], "%u", &dmc->assoc) != 1) {
 			ti->error = "dm-cache: Invalid cache associativity";
@@ -2002,12 +2122,15 @@ init:	/* Initialize the cache structs */
 		if(!persistence) dmc->cache[i].state = 0;
 		atomic_set(&dmc->cache[i].status, 0);
 		dmc->cache[i].counter = 0;
+                dmc->cache[i].disk = -1;
 		spin_lock_init(&dmc->cache[i].lock);
 	}
 
 	dmc->counter = 0;
 	dmc->dirty_blocks = 0;
 	dmc->reads = 0;
+        dmc->read_miss = 0;
+        dmc->write_miss = 0;
 	dmc->writes = 0;
 	dmc->cache_hits = 0;
 	dmc->replace = 0;
@@ -2132,37 +2255,112 @@ static int cache_status(struct dm_target *ti, status_type_t type,
 {
 	struct cache_c *dmc = shared_cache;
 	int sz = 0;
+        int i;
 
 	switch (type) {
 	case STATUSTYPE_INFO:
-		DMEMIT("stats: reads(%lu), writes(%lu), cache hits(%lu, 0.%lu)," \
-	           "replacement(%lu), replaced dirty blocks(%lu)",
-	           dmc->reads, dmc->writes, dmc->cache_hits,
+		DMEMIT("stats: reads(%lu) read_miss(%lu), writes(%lu) write_miss(%lu), cache hits(%lu, 0.%lu)," \
+	           "replacement(%lu), replaced dirty blocks(%lu)\n",
+	           dmc->reads, dmc->read_miss, dmc->writes, dmc->write_miss, dmc->cache_hits,
 	           (dmc->reads + dmc->writes) > 0 ? \
 	           dmc->cache_hits * 100 / (dmc->reads + dmc->writes) : 0,
 	           dmc->replace, dmc->writeback);
+                DMEMIT("*************List of Virtual Machines****************\n");
+                for(i = 0; i < ctn_dm_dev; i++)
+                {
+                    if(is_state(virtual_mapping[i].state, ENABLED))
+                    {
+                        DMEMIT("VM#%d => id: %s, share %llu, curent block count: %llu, max number of blocks: %llu "\
+                            "total number of blocks: %llu same_disk: %llu\n",
+                            (i+1), virtual_mapping[i].vm_id, virtual_mapping[i].share, virtual_mapping[i].block_counter,
+                            virtual_mapping[i].max_number_blocks, virtual_mapping[i].total_number_blocks,
+                            virtual_mapping[i].same_disk);
+                    }
+                }
 		break;
-	case STATUSTYPE_TABLE:
+	case STATUSTYPE_TABLE:/*Edited by Rachel Chavez Sanchez*/
 		DMEMIT("conf: capacity(%lluM), associativity(%u), block size(%uK), %s",
 	           (unsigned long long) dmc->size * dmc->block_size >> 11,
 	           dmc->assoc, dmc->block_size>>(10-SECTOR_SHIFT),
-	           dmc->write_policy ? "write-back":"write-through");
-		break;
+	           dmc->write_policy ? "write-back\n":"write-through\n");   
+                DMEMIT("*************List of Virtual Machines****************\n");
+                for(i = 0; i < ctn_dm_dev; i++)
+                {
+                    if(is_state(virtual_mapping[i].state, ENABLED))
+                    {
+                        DMEMIT("VM#%d => id: %s, share %llu, curent block count: %llu, max number of blocks: %llu "\
+                            "total number of blocks: %llu same_disk %llu\n",
+                            (i+1), virtual_mapping[i].vm_id, virtual_mapping[i].share, virtual_mapping[i].block_counter,
+                            virtual_mapping[i].max_number_blocks, virtual_mapping[i].total_number_blocks,
+                            virtual_mapping[i].same_disk);
+                    }
+                }
+                break;
 	}
 	return 0;
+}
+
+/*Added by Rachel Chavez Sanchez*/
+static int set_share(unsigned long long share, char* vm_name)
+{
+    int i;
+    unsigned long long total = 0;
+    int vm_id = -1;
+    
+    for(i = 0; i < ctn_dm_dev; i++)
+    {        
+        if(strcmp(virtual_mapping[i].vm_id, vm_name) == 0)
+        {
+            vm_id = i;
+        }
+        else
+        {
+            total += virtual_mapping[i].share;
+        }
+    }
+    if(total < 100 && vm_id > -1)
+    {
+        if((total + share) > 100)
+        {
+            unsigned long long dividend = 0;
+            unsigned long int rem = 0;
+
+            virtual_mapping[vm_id].share = 100 - total;
+            DPRINTK("VM#%d SET SHARE %llu MAX: %llu TOTAL: %llu\n",vm_id,virtual_mapping[vm_id].share,virtual_mapping[vm_id].max_number_blocks,virtual_mapping[vm_id].total_number_blocks);
+            dividend = (100 - total)*virtual_mapping[vm_id].total_number_blocks;
+            rem = do_div(dividend,100);
+            virtual_mapping[vm_id].max_number_blocks = dividend;
+            return 2;
+        }
+        else
+        {
+            unsigned long long dividend = 0;
+            unsigned long int rem = 0;
+
+            virtual_mapping[vm_id].share = share;
+            DPRINTK("VM#%d SET SHARE %llu MAX: %llu TOTAL: %llu\n",vm_id,virtual_mapping[vm_id].share,virtual_mapping[vm_id].max_number_blocks,virtual_mapping[vm_id].total_number_blocks);
+            dividend = share*virtual_mapping[vm_id].total_number_blocks;
+            rem = do_div(dividend,100);
+            virtual_mapping[vm_id].max_number_blocks = dividend;
+            return 1;
+        }
+    }
+    
+    return 0;
 }
 
 static int cache_message(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct v_map *map_dev = (struct v_map *) ti->private;
-	struct cache_c *dmc = shared_cache;
+	//struct cache_c *dmc = shared_cache;
+        int result;
 
-	if (argc != 1)
+	if (argc < 1)
 		goto error;
 
-	if (strcmp(argv[0], "flush")==0) {	
+	if (strcmp(argv[0], "flush") == 0) {
 		return flush_virtual_cache ( map_dev->identifier ); 
-	}else if (strcmp(argv[0],"disable")==0) {	
+	}else if (strcmp(argv[0],"disable") == 0) {
 		put_state(map_dev->state, DISABLED);
 		DPRINTK("DISABLING! %s,%d",map_dev->vm_id,map_dev->state);
 		return flush_virtual_cache ( map_dev->identifier ); 
@@ -2171,6 +2369,29 @@ static int cache_message(struct dm_target *ti, unsigned int argc, char **argv)
 		DPRINTK("ENABLING! %s,%d",map_dev->vm_id,map_dev->state);
 		return 1;
 	}
+        else if(strcmp(argv[0], "share") == 0)/*Edited by Rachel Chavez Sanchez*/
+        {
+            unsigned long long share = simple_strtol(argv[1], &argv[1], 10);
+            if(share <= 0)
+            {
+                goto error;
+            }
+            result = set_share(share, map_dev->vm_id);
+            if(result == 1)
+            {
+                DPRINTK("SETTING SHARE %llu FOR %s", share, map_dev->vm_id);
+                return 1;
+            }
+            else if(result == 2)
+            {
+                DPRINTK("SHARE SET FOR %s IS LESS THAN %llu", map_dev->vm_id, share);
+                return 1;
+            }
+            else
+            {
+                goto error;
+            }
+        }
 
 error:
 	DMWARN("unrecognised message received <%d>%s<  ",argc,argv[0]);
