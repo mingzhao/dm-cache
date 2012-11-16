@@ -1498,7 +1498,6 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 			bio->bi_size);
 /*   TRACING   */
 	if(map_dev->trace){
-		printk("tracing %llu\n",bio->bi_sector);
 		push_trace(bio->bi_sector, bio->bi_rw,bio->bi_size, map_dev->trace);
 	}
 
@@ -1695,7 +1694,6 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		virtual_mapping[idx_mapping].trace = NULL;
 		if( argc >= 9 ) {
 
-			printk("Enabling tracing!!\n");
 			virtual_mapping[idx_mapping].trace = kmalloc(sizeof(*virtual_mapping[idx_mapping].trace), GFP_KERNEL);
 			if (virtual_mapping[idx_mapping].trace == NULL) {
 				ti->error = "dm-trace: Cannot allocate linear context";
