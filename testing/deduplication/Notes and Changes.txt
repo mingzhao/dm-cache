@@ -1,0 +1,108 @@
+***Notes and Changes***
+
+My goal was to implement inline deduplication within Dm-Cache. While there is
+still much more work to be done, I hope that what I did figure out so far is
+useful later on. Here are the changes that I made.
+
+1) Simple.h
+This file contains all the data structures that I used. The two main structures
+are the fingerprint store and the sector map. The fingerprint store is a list
+of structs that hold two variable: a fingerprint (unsigned char *), and a list
+of cache sectors (sector_t). 
+
+The sector map is a list structs that also hold two variables: a source sector
+(sector_t) and a cache sector (sector_t). These two structures work together as
+follows:
+
+	a) When a write or read bio arrives, the sector map is searched for the 
+	   source sector of the bio. If it is found, then the cache sector that 
+	   it maps to is also found. For a read, the data is read from the cache 
+	   block. Write handling was not implemented, so this only works for a 
+	   write-through policy.
+
+	b) If the source sector is not found in the sector map, then Dm-cache goes
+	   its normal route until it is time to store the data in the cache device.
+	   The fingerprint of the data is taken and looked up in the fingerprint 
+	   store. If it is not found, then the fingerprint is added to the store. 
+	   Along with it, a list is created, with its first element being the cache
+	   sector that was assigned to that bio. The sector map is also updated to 
+	   hold the source sector and the cache sector. Then the data is stored in the
+	   cache.
+
+	c) If the fingerprint is found in the fingerprint store, the the list of 
+	   cache sectors is also obtained. For every cache sector, the matching
+	   cache block and the bio are compared based on the data they are holding.
+	   If no exact match is found, then the fingerprint is added to the store. 
+	   Along with it, a list is created, with its first element being the cache
+	   sector that was assigned to that bio. The sector map is also updated to 
+	   hold the source sector and the cache sector. Then the data is stored in the
+	   cache.
+
+	d) If an exact data match is found, then the sector map is updated to contain
+	   the source sector of the bio along with the cache sector of the cache block
+	   that matched it. No new data is stored in the cache device. The cache block
+	   that was originally assigned to the bio must be release back into the pool of
+	   available cache blocks.
+
+In addition to these two structures, a third one is used to hold a list of structs that
+hold two variables: a source sector (sector_t) and a status flag (int). Each cache block
+struct hold a pointer to one of these structs. The source sectors act as references to
+the sector map. The status flag is 0 for clean and 1 for dirty (since this only works 
+in write-through mode for now, these are always clean). The purpose of this is for the
+case when the cache block is invalidated or evicted for any reason. Any source sector
+that maps to that cache block must be removed from the sector map. If a flag is dirty, 
+the data in the cache block must be flushed to that source sector. For this reason, all
+cache block structs also have a pointer to their fingerprint for updating the fingerprint
+store upon eviction.
+
+***Code Reference***
+(Line Number(s) -> Explanation)
+
+85-86 -> Defining sizes for the fingerprint store list and the sector map list. These structures
+	 do not expand as needed, and no eviction policy is implemented yet, so after
+	 running for a while, this is guaranteed to crash eventually.
+
+132-134 -> The fingerprint is for referencing the fingerprint store list. The s_list is for
+	   referencing the sector map list. The integer 'loss' is for marking a cache block
+	   that needs to be returned to the pool of available blocks. This happens when
+	   a perfect match is found for a bio and the pre-allocated cache block is no
+	   longer needed.
+
+155-157 -> The f_list is a pointer to the fingerprint store. The m_list is a pointer to
+	   the sector map.
+
+560-599 -> The get_fingerprint method accepts the bio and a pointer to a unsigned char to
+	   store the result of the fingerprinting. I do not know much about scatter lists,
+	   but they are necessary in the linux kernel's crypto api. The list is set to be
+	   the same length as the number of elements in the bio's bio vector. The md5 
+	   hashing algorithm is used here, but any other algorithm can be used. The crypto
+	   _hash_final() function stores the result in the unsigned char *. 
+
+603-629 -> The data compare function takes a bio and a cache sector. It compares the data
+	   in the bio with the data in the cache block (matching the cache sector) and 
+	   returns the result of a comparison between the two. 
+
+661     -> Deduplication is attempted only if the bio is holding 4k of data or more.
+
+638-743 -> Read the comments for more information
+
+849-855 -> In the flush_bios function, there is a check for prematurely allocated blocks
+	   that need to be returned to the pool of available cache blocks.
+
+1149 -> Clear the s_list, just in case
+
+1171-1198 -> If a cache block is being invalidated, we must remove any reference to it
+	     in the sector map list and the fingerprint store list. Flushing back to
+	     dirty sectors is not implemented yet.
+
+1458-1475 -> In cache_map, the sector map list is searched for the source sector of the
+	     bio. If it is found, the cache sector is used in the cache_hit function.
+	     Otherwise, Dm-Cache does cache lookup and continues on its regular path.
+
+1862-1865 -> Initialize newly added variables in cache block structs. 
+
+1956 -> cache_status altered for testing puposes. It tells the tester how many cache 
+	blocks are free and not.
+
+2060-2062 -> Initializes the fingerprint store list and the sector map list. The store_count
+	     is for testing purposes.
