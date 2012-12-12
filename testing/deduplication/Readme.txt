@@ -1,0 +1,1 @@
+Simple.h contains all the data structures that I used in dm-cache to implement the deduplication functionality.
