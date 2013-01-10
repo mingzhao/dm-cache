@@ -43,6 +43,7 @@
 #include <linux/dm-io.h>
 #include <linux/blktrace_api.h>
 #include <linux/hrtimer.h>
+//#include <linux/radix-tree.h>
 
 #include "dm.h"
 #include "dm-bio-list.h"
@@ -71,7 +72,7 @@
 #define DEFAULT_WRITE_POLICY WRITE_THROUGH
 
 /* Number of pages for I/O */
-#define DMCACHE_COPY_PAGES 1024
+#define DMCACHE_COPY_PAGES 2048
 
 /* States of a cache block */
 #define INVALID		0
@@ -80,6 +81,9 @@
 #define DIRTY		4	/* Locally modified */
 #define WRITEBACK	8	/* In the process of write back */
 #define WRITETHROUGH	16	/* In the process of write through */
+
+#define IDLE		0
+#define PEDING_WRITE	1	
 
 #define is_state(x, y)		(x & y)
 #define set_state(x, y)		(x |= y)
@@ -223,7 +227,7 @@ struct kcached_job {
 ******************************************************************/
 
 #define MIN_JOBS        1024
-#define MAX_SECTORS     2
+#define MAX_SECTORS     8
 
 static LIST_HEAD(_trace_jobs);
 static DEFINE_SPINLOCK(_trace_lock);
@@ -234,14 +238,17 @@ atomic_t nr_traces;
 
 static struct workqueue_struct *trace_wq;
 static struct work_struct trace_work;
+struct dm_io_client *trace_io_client;
 
 struct trace_c {
+	int identifier;	/* virtual machine mapping */
         struct dm_dev *dev;
         struct dm_dev *trace_dev;
         sector_t trace_pos;
         sector_t trace_sector;
         void *write_buf;
-        struct dm_io_client *io_client;   /* Client memory pool*/
+	int state;
+	spinlock_t lock;	/* Lock to protect memmove operations on the trace_buf */
 };
 
 struct trace_job {
@@ -260,7 +267,7 @@ static const u32 ddir_act[2] = { BLK_TC_ACT(BLK_TC_READ),
 /* The ilog2() calls fall out because they're constant */
 #define MASK_TC_BIT(rw, __name) ((rw & REQ_ ## __name) << \
           (ilog2(BLK_TC_ ## __name) + BLK_TC_SHIFT - __REQ_ ## __name))
-
+#define BIT_SIZE	48
 
 static inline struct trace_job *pop_t(struct list_head *jobs)
 {
@@ -344,65 +351,79 @@ void push_trace(sector_t sector, int rw, int bytes, struct trace_c *trace)
         }
 }
 
-static int write_data( struct block_device * bdev, sector_t sector,
-                void * data, int count, struct dm_io_client *io_client)
+static void trace_callback(unsigned long error, void *context)
 {
-        struct io_region where;
-        unsigned long error_bits;
-        int ret  = -1;
+	struct trace_c *trace = (struct trace_c *) context;
+	int left;
 
-        where.sector = sector;
-        where.count = count;
-        where.bdev = bdev;
+	spin_lock(&trace->lock);
 
-        DPRINTK("TRACE: writing to disk %llu",(unsigned long long) sector);
-	ret = dm_io_sync_vm(1, &where, WRITE, data, &error_bits);
-
-        return ret;
+        DPRINTK("TRACE(%d): callback pos: %llu\n", trace->identifier, 
+			(unsigned long long) trace->trace_pos);
+	left = trace->trace_pos - (MAX_SECTORS*512);
+	trace->trace_sector += MAX_SECTORS;
+	memmove (trace->write_buf , trace->write_buf + (MAX_SECTORS * 512), left);
+	trace->trace_pos = left;
+	trace->state = IDLE;
+        DPRINTK("TRACE(%d): callback move pos: %llu\n", trace->identifier, 
+			(unsigned long long) trace->trace_pos);
+	spin_unlock(&trace->lock);
 }
 
-static int write_trace(struct trace_job * job) //struct bio *bio, struct trace_c *trace)
+static int write_data(struct trace_c *trace, int count)
 {
-        int ret=0, size;
-        struct trace_c *trace;
-        int tail=0, left=0;
+	struct io_region where;
+	struct dm_io_request iorq;
+	unsigned long error_bits;
+	int ret  = -1;
 
-        trace = job->trace;
+	where.sector = trace->trace_sector;
+	where.count = count;
+	where.bdev = trace->trace_dev->bdev;
 
-        DPRINTK("TRACE: %llu pos:%llu",(unsigned long long) job->bit.sector,
-                                        (unsigned long long) trace->trace_pos);
+	DPRINTK("TRACE(%d): writing to disk %llu\n", trace->identifier, 
+			(unsigned long long) trace->trace_sector);
 
-        size = sizeof(struct blk_io_trace);
+	iorq.bi_rw= WRITE;
+	iorq.mem.type = DM_IO_VMA;
+	iorq.mem.ptr.vma = trace->write_buf;
+	iorq.notify.fn = NULL;
+	iorq.client = trace_io_client;
 
-        DPRINTK("TRACE: writing to memory %llu",(unsigned long long) trace->trace_pos);
-        if(trace->trace_pos + size > (MAX_SECTORS * 512)){
-                tail = (MAX_SECTORS*512)-trace->trace_pos;
-                left = size - tail;
+	ret= dm_io(&iorq, 1, &where, &error_bits);
+	trace_callback(0,trace);
 
-                memcpy (trace->write_buf + trace->trace_pos, &job->bit, size);
-
-                write_data(trace->trace_dev->bdev,
-                                trace->trace_sector,
-                                trace->write_buf,
-                                MAX_SECTORS,
-                                trace->io_client);
-                trace->trace_pos = 0;
-                trace->trace_sector += MAX_SECTORS;
-
-                memset(trace->write_buf, 0, size);
-                memmove (trace->write_buf , trace->write_buf + (MAX_SECTORS * 512), left);
-                trace->trace_pos += left;
-        }else{
-                memcpy (trace->write_buf + trace->trace_pos , &job->bit, size);
-                trace->trace_pos += size;
-        }
-
-        mempool_free(job, _trace_pool);
-        atomic_dec(&nr_traces);
-
-        return ret;
+	return ret;
 }
-static void do_trace(void *ignored)
+
+static int write_trace(struct trace_job * job) 
+{
+	int ret=0;
+	struct trace_c *trace;
+	int tail=0, left=0;
+
+	trace = job->trace;
+
+	spin_lock(&trace->lock);
+	memcpy (trace->write_buf + trace->trace_pos, &job->bit, BIT_SIZE);
+	trace->trace_pos += BIT_SIZE;
+	DPRINTK("TRACE(%d): %llu pos:%llu\n",trace->identifier, (unsigned long long) job->bit.sector,
+			(unsigned long long) trace->trace_pos);
+	spin_unlock(&trace->lock);
+
+	if((trace->trace_pos > (MAX_SECTORS * 512)))
+	{
+		trace->state = PEDING_WRITE;
+		write_data(trace, MAX_SECTORS);
+	}
+
+	mempool_free(job, _trace_pool);
+	atomic_dec(&nr_traces);
+
+	return ret;
+}
+
+static void do_trace(struct work_struct *ignored)
 {
         process_traces(&_trace_jobs, write_trace);
 }
@@ -431,7 +452,6 @@ static void reboot_map (unsigned long ptr);
  * which case additional pages are required for the request that is forwarded
  * to the server. A pool of pages are reserved for this purpose.
  */
-
 static struct page_list *alloc_pl(void)
 {
 	struct page_list *pl;
@@ -544,8 +564,6 @@ static inline void wake(void)
 	queue_work(_kcached_wq, &_kcached_work);
 }
 
-#define MIN_JOBS 1024
-
 static struct kmem_cache *_job_cache;
 static mempool_t *_job_pool;
 
@@ -571,7 +589,7 @@ static int jobs_init(void)
 		return -ENOMEM;
 	}
 
-        _trace_cache = kmem_cache_create("trace-jobs",
+        _trace_cache = kmem_cache_create("traces",
                                        sizeof(struct trace_job),
                                        __alignof__(struct trace_job),
                                        0, NULL,NULL);
@@ -1054,57 +1072,10 @@ void kcached_client_destroy(struct cache_c *dmc)
 }
 
 /****************************************************************************
- * Functions for writing back dirty blocks.
- * We leverage kcopyd to write back dirty blocks because it is convenient to
- * use and it is not reasonble to reimplement the same function here. But we
- * need to reserve pages for both kcached and kcopyd. TODO: dynamically change
- * the number of reserved pages.
- ****************************************************************************/
-/*
-static void copy_callback(int read_err, unsigned int write_err, void *context)
-{
-	struct cacheblock *cacheblock = (struct cacheblock *) context;
-
-	flush_bios(cacheblock);
-}
-
-static void copy_block(struct cache_c *dmc, struct io_region src,
-	                   struct io_region dest, struct cacheblock *cacheblock)
-{
-	DPRINTK("Copying: %llu:%llu->%llu:%llu",
-			src.sector, src.count * 512, dest.sector, dest.count * 512);
-	kcopyd_copy(dmc->kcp_client, &src, 1, &dest, 0, \
-			(kcopyd_notify_fn) copy_callback, (void *)cacheblock);
-}
-
-static void write_back(struct cache_c *dmc,struct cacheblock *cache, unsigned int length)
-{
-	struct io_region src, dest;
-	struct cacheblock *writecache;
-	unsigned int i;
-
-	src.bdev = dmc->cache_dev->bdev;
-	src.sector = cache->cacheblock << dmc->block_shift;
-	src.count = dmc->block_size * length;
-	dest.bdev = virtual_mapping[cache->disk].src_dev->bdev;
-	dest.sector = cache->block;
-	dest.count = dmc->block_size * length;
-
-	for (i=0; i<length; i++)
-	{	
-		writecache = radix_tree_lookup(dmc->cache, get_block_index((cache->block)+i,cache->disk));
-		if(writecache != NULL){
-			set_state(writecache->state, WRITEBACK);
-		}
-	}
-	dmc->dirty_blocks -= length;
-	copy_block(dmc, src, dest, cache); 
-}
-*/
-/****************************************************************************
  *  Functions for implementing the various cache operations.
  ****************************************************************************/
-static sector_t get_block_index(sector_t block, int disk){
+static sector_t get_block_index(sector_t block, int disk)
+{
 	return ( block + virtual_mapping[disk].dev_offset);
 }
 
@@ -1119,7 +1090,6 @@ static int cache_insert(struct cache_c *dmc, sector_t block,
 	 */
 	set_state(cache->state, RESERVED);
 	cache->disk = disk;
-
 	radix_tree_insert(dmc->cache, get_block_index(block,disk), (void *) cache);
 
 	return 1;
@@ -1132,7 +1102,6 @@ static void cache_invalidate(struct cache_c *dmc, struct cacheblock *cache, unsi
 {
 	DPRINTK("Cache invalidate: Block %llu(%llu)",
                 cache->cacheblock, index);
-	
 	clear_state(cache->state, VALID);
 	radix_tree_delete(dmc->cache, index);
 }
@@ -1447,7 +1416,6 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 			bio->bi_size);
 /*   TRACING   */
 	if(map_dev->trace){
-		printk("tracing %llu\n",bio->bi_sector);
 		push_trace(bio->bi_sector, bio->bi_rw,bio->bi_size, map_dev->trace);
 	}
 
@@ -1558,7 +1526,8 @@ out:
 	return r;
 }
 
-static int get_vm_index(char *vm_identifier){
+static int get_vm_index(char *vm_identifier)
+{
 	int i;
 	DPRINTK("VM_name %s",vm_identifier);
 
@@ -1641,6 +1610,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			r = -EINVAL;
 			goto bad2;
 		}	
+
 		virtual_mapping[idx_mapping].trace = NULL;
 		if( argc >= 9 ) {
 
@@ -1659,9 +1629,10 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 				goto bad1;
 			}
 
+			virtual_mapping[idx_mapping].trace->identifier = idx_mapping;
 			virtual_mapping[idx_mapping].trace->trace_pos = 0;
 			virtual_mapping[idx_mapping].trace->trace_sector = 0;
-			virtual_mapping[idx_mapping].trace->write_buf = vmalloc( MAX_SECTORS  * 512  + (512));
+			virtual_mapping[idx_mapping].trace->write_buf = vmalloc( MAX_SECTORS  * 512  * 2);
 			if(!virtual_mapping[idx_mapping].trace->write_buf)
 			{
 				ti->error = "Failed to allocate memory for write buffer\n";
@@ -1669,6 +1640,17 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			}
 
 			memset(virtual_mapping[idx_mapping].trace->write_buf, 0, sizeof(virtual_mapping[idx_mapping].trace->write_buf));
+
+			virtual_mapping[idx_mapping].trace->state = IDLE;
+			spin_lock_init(&virtual_mapping[idx_mapping].trace->lock);
+			
+			trace_io_client = dm_io_client_create(16);
+			if (IS_ERR(trace_io_client)) {
+				r = PTR_ERR(trace_io_client);
+				ti->error = "Failed to create io client\n";
+				goto bad1a;
+			}
+
 		}	
 	}else{
 		ti->error = "dm-cache: Requires Virtual Machine identifier";
@@ -1978,7 +1960,6 @@ bad:
 #define RADIX_TREE_INDEX_BITS  (8 /* CHAR_BIT */ * sizeof(unsigned long))
 #define RADIX_TREE_MAX_PATH (RADIX_TREE_INDEX_BITS/RADIX_TREE_MAP_SHIFT
 
-
 struct radix_tree_node {
 	unsigned int    count;
 	void            *slots[RADIX_TREE_MAP_SIZE];
@@ -2038,7 +2019,6 @@ static __init unsigned long maxindex(unsigned int height)
 		index = ~0UL;
 	return index;
 }
- 
 
 int radix_tree_flush(struct radix_tree_root *root)
 {
@@ -2080,12 +2060,7 @@ static void cache_dtr(struct dm_target *ti)
 	struct v_map *map_dev = (struct v_map *) ti->private;
 	struct dm_dev_internal *dd;
 	dd = container_of(dmc->cache_dev, struct dm_dev_internal,dm_dev);
-/*
-	if (dmc->dirty_blocks > 0) { 
-		DPRINTK("Cleaning dirty blocks!! %d",cnt_active_map);
-		cache_flush(dmc,map_dev->identifier);
-	}
-*/
+
 	if(cnt_active_map == 1) {
 		kcached_client_destroy(dmc);
 		kcopyd_client_destroy(dmc->kcp_client);
@@ -2125,6 +2100,11 @@ static void cache_dtr(struct dm_target *ti)
 		DPRINTK("Free to destroy: %d",cnt_active_map);
 		return;
 	}
+
+	if (map_dev->trace){
+		dm_put_device(ti, map_dev->trace->trace_dev);
+		kfree(map_dev->trace);
+	}
 	
 	flush_virtual_cache(map_dev->identifier);
 	put_state(map_dev->state,DISABLED);
@@ -2144,7 +2124,6 @@ static void reboot_map( unsigned long ptr )
 	put_state(map_dev->state,DISABLED);
 	flush_virtual_cache(map_dev->identifier);
 }
-
 
 /*
  * Report cache status:
@@ -2189,6 +2168,7 @@ static int cache_message(struct dm_target *ti, unsigned int argc, char **argv)
 	struct v_map *map_dev = (struct v_map *) ti->private;
         struct cache_c *dmc = shared_cache;
 	int ms_sec;
+	struct radix_tree_node  node;
 
 	if (argc != 1 && argc != 2)
 		goto error;
@@ -2213,7 +2193,6 @@ static int cache_message(struct dm_target *ti, unsigned int argc, char **argv)
 		else
 			ms_sec=120000;
 		mod_timer(&shared_cache->reboot_time, jiffies + msecs_to_jiffies(ms_sec));
-		
 		return 1;
 	} 
 
