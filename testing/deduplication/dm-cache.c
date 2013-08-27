@@ -37,15 +37,17 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/pagemap.h>
-#include "dm.h"
+#include "/usr/src/linux-3.2.2/drivers/md/dm.h"
 #include <linux/dm-io.h>
 #include <linux/dm-kcopyd.h>
-#include <linux/simple.h>
+
+/* New Include Files for Deduplication */
+#include <linux/rbtree.h>
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
-#include <linux/buffer_head.h>
+#include <linux/time.h>
 
-#define DMC_DEBUG 1
+#define DMC_DEBUG 0
 
 #define DM_MSG_PREFIX "cache"
 #define DMC_PREFIX "dm-cache: "
@@ -80,10 +82,6 @@
 #define is_state(x, y)		(x & y)
 #define set_state(x, y)		(x |= y)
 #define clear_state(x, y)	(x &= ~y)
-
-/* Table Sizes */
-#define FP_SIZE 50000
-#define SM_SIZE 50000
 
 /*
  * Cache context
@@ -120,6 +118,22 @@ struct cache_c {
 	unsigned long replace;		/* Number of cache replacements */
 	unsigned long writeback;	/* Number of replaced dirty blocks */
 	unsigned long dirty;		/* Number of submitted dirty blocks */
+
+	/* Dedup stats */
+	unsigned long considered;	/* Number of blocks considered for deduplication */
+	unsigned long new_data;		/* Number of blocks with new data */
+	unsigned long matches;		/* Number of blocks that had a matching fingerprint in the cache */
+	unsigned long deduped;		/* Number of blocks actually deduplicated */
+	unsigned long redirects;	/* Number of writes redirected to prevent overwriting useful data */
+
+	struct rb_root * sources;	/* A map of source devices sectors to cache device sectors */
+	struct rb_root * fingerprints;	/* A map of fingerprints to cache device sectors */
+
+	unsigned int max_sources;
+	unsigned int max_fingerprints;
+
+	unsigned int source_count;
+	unsigned int fingerprint_count;
 };
 
 /* Cache block metadata structure */
@@ -129,9 +143,10 @@ struct cacheblock {
 	unsigned short state;	/* State of a block */
 	unsigned long counter;	/* Logical timestamp of the block's last access */
 	struct bio_list bios;	/* List of pending bios */
-	unsigned char * fingerprint; /*The fingerprint for this block */
-	struct sector_status_list * s_list;     /*List of source sectors mapped to this block */ 
-	int loss;
+	struct rb_root * blocks; /* Sector numbers for cached blocks */
+	int references;		 /* Number of cached blocks represented by this structure */
+	int dirty_references;    /* Number of cached blocks that are dirty */
+	unsigned char * hash;	 /* Hash of the data in this cache block */
 };
 
 /* Structure for a kcached job */
@@ -152,9 +167,38 @@ struct kcached_job {
 	struct page_list *pages;
 };
 
-struct fingerprint_list * f_list;
-struct sector_map_list * m_list;
-int store_count;
+/* Structure for metadata of cached blocks */
+struct block_metadata {
+	sector_t sector; /* Sector of the cached block */
+	int dirty; 	 /* State of the cached block (0 = clean, 1 = dirty) */
+	struct rb_node node; /* Node for tree structure in the cacheblock */
+};
+
+/* Structure for mapping a source device sector to a cache device sector */
+struct mapping {
+	sector_t source;	/* A source device sector */
+	sector_t cache;		/* A cache device sector */
+	int dirty;
+	long timestamp;
+	struct rb_node node;	/* Node for the tree structure for the cache device */
+};
+
+/* Structure for mapping a hash to several matching cacheblocks */
+struct fingerprint {
+	unsigned char * hash; 	     /* A hash that represents a block from the source device */
+	int size;		     /* Count of caches related to this fingerprint */
+	long timestamp;
+	struct rb_node node;	     /* Node for the tree structure for the cache device */
+	struct rb_root * caches;     /* Root for tree of cache indexes represented by the fingerprint */
+};
+
+/* Structure used by the fingerprint to identify cacheblocks */
+struct identifier {
+	sector_t cache;		/* Index for the cacheblock represented in this identifier */
+	struct rb_node node;	/* Node for tree structure that a fingerprint points to */	
+};
+
+static void lru_mappings(struct cache_c * dmc);
 
 /****************************************************************************
  *  Wrapper functions for using the new dm_io API
@@ -385,6 +429,898 @@ static inline void push(struct list_head *jobs, struct kcached_job *job)
 	spin_unlock_irqrestore(&_job_lock, flags);
 }
 
+/*****************************************************************************
+* Functions for initializing structures needed for deduplication
+*****************************************************************************/
+
+static struct block_metadata * init_block_metadata(sector_t sector, int dirty)
+{
+	struct block_metadata * bmd;
+
+	//printk("init_block_metadata\n");
+
+	bmd = kmalloc(sizeof(*bmd), GFP_KERNEL);
+
+	bmd->sector = sector;
+	bmd->dirty = dirty;
+
+	return bmd;
+}
+
+static struct fingerprint * init_fingerprint(unsigned char * hash)
+{
+	struct fingerprint * fingerprint;
+	struct timespec * ts;
+
+	//printk("init_fingerprint\n");
+
+	fingerprint = kmalloc(sizeof(*fingerprint), GFP_KERNEL);
+
+	fingerprint->hash = hash;
+	fingerprint->size = 0;
+	
+	ts = kmalloc(sizeof(*ts), GFP_KERNEL);
+	getnstimeofday(ts);
+	fingerprint->timestamp = ts->tv_nsec;
+	kfree(ts);
+
+	fingerprint->caches = kmalloc(sizeof(*fingerprint->caches), GFP_KERNEL);
+
+	*fingerprint->caches = RB_ROOT;
+
+	return fingerprint;
+}
+
+static void dest_fingerprint(struct fingerprint * fingerprint)
+{
+	printk("dest_fingerprint\n");
+	printk("hash\n");
+	
+	if(fingerprint->hash)
+	{
+		kfree(fingerprint->hash);
+	}
+
+	printk("caches\n");
+
+	if(fingerprint->caches)
+	{
+		kfree(fingerprint->caches);
+	}
+
+	kfree(fingerprint);
+}
+
+static struct identifier * init_identifier(sector_t cache)
+{
+	struct identifier * id;
+
+	//printk("init_identifier\n");
+
+	id = kmalloc(sizeof(*id), GFP_KERNEL);
+
+	id->cache = cache;
+
+	return id;
+}
+
+static struct mapping * init_mapping(sector_t source, sector_t cache, int dirty)
+{
+	struct mapping * mapping;
+	struct timespec * ts;
+
+	//printk("init_mapping\n");
+
+	mapping = kmalloc(sizeof(*mapping), GFP_KERNEL);
+
+	mapping->source = source;
+	mapping->cache = cache;
+	mapping->dirty = dirty;
+
+	ts = kmalloc(sizeof(*ts), GFP_KERNEL);
+	getnstimeofday(ts);
+	mapping->timestamp = ts->tv_nsec;
+	kfree(ts);
+
+	return mapping;
+}
+
+/*****************************************************************************
+* Functions for manipulating deduplication structures
+*****************************************************************************/
+
+/* Add block metadata to a cache block*/
+static void add_block_metadata(struct cache_c * dmc, struct block_metadata * bmd, struct cacheblock * cacheblock)
+{
+	struct rb_node ** link = &cacheblock->blocks->rb_node, *parent;
+	struct block_metadata * old_bmd;
+
+	//printk("add_block_metadata\n");
+
+	parent = NULL;
+
+	while(*link)
+	{
+		parent = *link;
+		old_bmd = rb_entry(parent, struct block_metadata, node);
+
+		if(bmd->sector < old_bmd->sector)
+		{
+			link = &(*link)->rb_left;
+		}
+		else
+		{
+			link = &(*link)->rb_right;
+		}
+	}
+
+	rb_link_node(&bmd->node, parent, link);
+	rb_insert_color(&bmd->node, cacheblock->blocks);
+
+	cacheblock->references++;
+	
+	if(bmd->dirty)
+	{
+		if(!is_state(cacheblock->state, DIRTY)) 
+	  	{
+	    		set_state(cacheblock->state, DIRTY);
+	    		dmc->dirty_blocks++;
+	  	}
+
+		cacheblock->dirty_references++;
+	}
+}
+
+/* Return the next dirty sector for write_back */
+static sector_t get_dirty_sector(struct cache_c * dmc, struct cacheblock * cacheblock)
+{
+	struct rb_node * next;
+	struct block_metadata * bmd;
+	struct rb_node * node = rb_first(cacheblock->blocks);
+
+	//printk("get_dirty_sector\n");
+
+	while(node)
+	{
+		next = rb_next(node);
+		bmd = rb_entry(node, struct block_metadata, node);
+		
+		if(bmd->dirty)
+		{
+			bmd->dirty = 0;
+			return bmd->sector;
+		}
+
+		node = next;
+	}
+
+	return 0;
+}
+
+static void remove_block_metadata(struct cacheblock * cacheblock, sector_t source)
+{
+	struct rb_node * node = cacheblock->blocks->rb_node;
+	struct block_metadata * bmd;
+
+	//printk("remove_block_metadata\n");
+
+	while(node)
+	{
+		bmd = rb_entry(node, struct block_metadata, node);
+
+		if(source < bmd->sector)
+		{
+			node = node->rb_left;
+		}
+		else if(source > bmd->sector)
+		{
+			node = node->rb_right;
+		}
+		else
+		{
+			rb_erase(node, cacheblock->blocks);
+			kfree(bmd);
+			cacheblock->references--;
+			return;
+		}
+	}
+}
+
+/* Remove block metadata from a cache block (should be called in a loop) */
+static sector_t remove_all_block_metadata(struct cacheblock * cacheblock)
+{
+	struct block_metadata * bmd;
+	sector_t sector;
+	struct rb_node * first = rb_first(cacheblock->blocks);
+
+	if(!first)
+	{
+		printk("first is null\n");
+		return 0;
+	}
+	
+	bmd = rb_entry(first, struct block_metadata, node);
+
+	if(!bmd)
+	{
+		printk("bmd is null\n");
+		return 0;
+	}
+
+	sector = bmd->sector;
+	rb_erase(first, cacheblock->blocks);
+	kfree(bmd);
+	cacheblock->references--;	
+
+	return sector;
+}
+
+/* Add a mapping to the mapping tree */
+static void add_mapping(struct cache_c * dmc, struct mapping * mapping)
+{
+	struct rb_node ** link = &dmc->sources->rb_node, *parent;
+	struct mapping * old_mapping;
+
+	//printk("add_mapping\n");
+
+	parent = NULL;
+
+	while(*link)
+	{
+		parent = *link;
+		old_mapping = rb_entry(parent, struct mapping, node);
+
+		if(mapping->source < old_mapping->source)
+		{
+			link = &(*link)->rb_left;
+		}
+		else
+		{
+			link = &(*link)->rb_right;
+		}
+	}
+
+	rb_link_node(&mapping->node, parent, link);
+	rb_insert_color(&mapping->node, dmc->sources);
+
+	dmc->source_count++;
+}
+
+static void update_mapping(struct mapping * mapping)
+{
+	struct timespec * ts;
+
+	//printk("update_mapping\n");
+
+	ts = kmalloc(sizeof(*ts), GFP_KERNEL);
+	getnstimeofday(ts);
+	mapping->timestamp = ts->tv_nsec;
+	kfree(ts);
+}
+
+/* Given a source device sector, returns a cache device sector */
+static sector_t map_sectors(struct cache_c * dmc, sector_t source)
+{
+	struct rb_node * node = dmc->sources->rb_node;
+	struct mapping * mapping;
+
+	//printk("make_sectors\n");
+
+	while(node)
+	{
+		mapping = rb_entry(node, struct mapping, node);
+
+		if(source < mapping->source)
+		{
+			node = node->rb_left;
+		}
+		else if(source > mapping->source)
+		{
+			node = node->rb_right;
+		}
+		else
+		{
+			update_mapping(mapping);
+			return mapping->cache;
+		}
+	}
+
+	return 0;
+}
+
+/* Remove a mapping from the mapping tree */
+static sector_t remove_mapping(struct cache_c * dmc, sector_t source)
+{
+	struct rb_node * node = dmc->sources->rb_node;
+	struct mapping * mapping;
+	sector_t sector;
+
+	while(node)
+	{
+		mapping = rb_entry(node, struct mapping, node);
+
+		if(!mapping)
+		{
+			break;
+		}
+
+		if(source < mapping->source)
+		{
+			node = node->rb_left;
+		}
+		else if(source > mapping->source)
+		{
+			node = node->rb_right;
+		}
+		else
+		{
+			sector = mapping->source;
+			rb_erase(node, dmc->sources);
+			kfree(mapping);
+			dmc->source_count--;
+			//printk("mapping count: %d\n", dmc->source_count);
+			return sector;
+		}
+	}
+
+	return 0;
+}
+
+static void clean_cacheblock(struct cache_c * dmc, struct cacheblock * cacheblock)
+{
+	sector_t source;
+
+	while(cacheblock->references > 0)
+	{
+		//printk("ref count: %d\n", cacheblock->references);
+
+		source = remove_all_block_metadata(cacheblock);
+
+		//printk("source: %llu\n", source);
+
+		if(source > 0)
+		{
+			remove_mapping(dmc, source);
+		}
+		else
+		{
+			break;
+		}
+	}
+}
+
+/* Remove all mappings from the tree of mappings */
+static void remove_all_mappings(struct cache_c * dmc)
+{
+	struct rb_node * node = rb_first(dmc->sources);
+	struct rb_node * next;
+	struct mapping * mapping;
+
+	//printk("remove_all_mappings\n");
+
+	while(node)
+	{
+		next = rb_next(node);
+		mapping = rb_entry(node, struct mapping, node);
+		rb_erase(node, dmc->sources);
+		kfree(mapping);
+		node = next;
+	}
+}
+
+/* Compare two hashes */
+static int fingerprint_compare(unsigned char * fp1, unsigned char * fp2)
+{
+	//printk("fingerprint_compare\n");
+	return memcmp(fp1, fp2, 16);
+}
+
+/* Add a cache identifier to a fingerprint cache tree */
+static void add_identifier(struct fingerprint * fingerprint, struct identifier * id)
+{
+	struct rb_node ** link = &fingerprint->caches->rb_node, *parent;
+	struct identifier * old_id;
+
+	//printk("add_indentifier\n");
+
+	parent = NULL;
+
+	while(*link)
+	{
+		parent = *link;
+		old_id = rb_entry(parent, struct identifier, node);
+
+		if(id->cache < old_id->cache)
+		{
+			link = &(*link)->rb_left;
+		}
+		else
+		{
+			link = &(*link)->rb_right;
+		}
+	}
+
+	rb_link_node(&id->node, parent, link);
+	rb_insert_color(&id->node, fingerprint->caches);
+	fingerprint->size++;	
+}
+
+/* Remove a cache identifier from a fingerprint cache tree */
+static sector_t remove_identifier(struct cache_c * dmc, struct fingerprint * fingerprint, sector_t cache)
+{
+	struct rb_node * node = fingerprint->caches->rb_node;
+	struct identifier * id;
+	sector_t sector;
+
+	//printk("remove_identifier\n");
+
+	while(node)
+	{
+		id = rb_entry(node, struct identifier, node);
+
+		if(!id)
+		{
+			break;
+		}
+
+		if(cache < id->cache)
+		{
+			node = node->rb_left;
+		}
+		else if(cache > id->cache)
+		{
+			node = node->rb_right;
+		}
+		else
+		{
+			sector = id->cache;
+			rb_erase(node, fingerprint->caches);
+			kfree(id);
+			//printk("fingerprint size: %d\n", fingerprint->size);
+			fingerprint->size--;
+
+			if(fingerprint->size == 0)
+			{
+				//printk("murdering fingerprint\n");
+				rb_erase(&fingerprint->node, dmc->fingerprints);
+				dmc->fingerprint_count--;
+				/* Problem!! */
+				//dest_fingerprint(fingerprint);
+			}
+
+			return sector;
+		}
+	}
+
+	return 0;
+}
+
+/* Remove all cache identifiers from a fingerprint cache tree */
+static void remove_all_identifiers(struct fingerprint * fingerprint)
+{
+	struct rb_node * node = rb_first(fingerprint->caches);
+	struct rb_node * next;
+	struct identifier * id;
+
+	//printk("remove_all_identifiers\n");
+
+	while(node)
+	{
+		next = rb_next(node);
+		id = rb_entry(node, struct identifier, node);
+		rb_erase(node, fingerprint->caches);
+		kfree(id);
+		node = next;
+	}
+}
+
+/* Add a fingerprint to the fingerprint tree */
+static void add_fingerprint(struct fingerprint * fingerprint, struct cache_c * dmc)
+{
+	struct rb_node ** link = &dmc->fingerprints->rb_node, *parent;
+	struct fingerprint * old_fingerprint;
+	int comparison;
+
+	//printk("add_fingerprint\n");
+
+	parent = NULL;
+
+	while(*link)
+	{
+		parent = *link;
+		old_fingerprint = rb_entry(parent, struct fingerprint, node);
+		comparison = fingerprint_compare(fingerprint->hash, old_fingerprint->hash);
+
+		if(comparison < 0)
+		{
+			link = &(*link)->rb_left;
+		}
+		else
+		{
+			link = &(*link)->rb_right;
+		}
+	}
+
+	rb_link_node(&fingerprint->node, parent, link);
+	rb_insert_color(&fingerprint->node, dmc->fingerprints);	
+
+	dmc->fingerprint_count++;
+}
+
+static void update_fingerprint(struct fingerprint * fingerprint)
+{
+	struct timespec * ts;
+
+	//printk("update_fingerprint\n");
+
+	ts = kmalloc(sizeof(*ts), GFP_KERNEL);
+	getnstimeofday(ts);
+	fingerprint->timestamp = ts->tv_nsec;
+	kfree(ts);
+}
+
+/* Look up a hash in the fingerprint tree */
+static struct fingerprint * lookup(struct cache_c * dmc, unsigned char * hash)
+{
+	struct rb_node * node = dmc->fingerprints->rb_node;
+	struct fingerprint * fingerprint;
+	int comparison;
+
+	while(node)
+	{
+		fingerprint = rb_entry(node, struct fingerprint, node);
+
+		if(!fingerprint)
+		{
+			//printk("lookup fail 1\n");
+			break;
+		}
+
+		if(!fingerprint->hash)
+		{
+			//printk("lookup fail 2\n");
+			break;
+		}
+
+		comparison = fingerprint_compare(hash, fingerprint->hash);
+
+		if(comparison < 0)
+		{
+			node = node->rb_left;
+		}
+		else if(comparison > 0)
+		{
+			node = node->rb_right;
+		}
+		else
+		{
+			return fingerprint;
+		}
+	}
+
+	return NULL;
+}
+
+/* Remove all fingerprints from the fingerprint tree */
+static void remove_all_fingerprints(struct cache_c * dmc)
+{
+	struct rb_node * node = rb_first(dmc->fingerprints);
+	struct rb_node * next;
+	struct fingerprint * fingerprint;
+
+	//printk("remove_all_fingerprint\n");
+
+	while(node)
+	{
+		next = rb_next(node);
+		fingerprint = rb_entry(node, struct fingerprint, node);
+		rb_erase(node, dmc->fingerprints);
+		dmc->fingerprint_count--;
+		remove_all_identifiers(fingerprint);
+		dest_fingerprint(fingerprint);
+		node = next;
+	}
+}
+
+static struct mapping * lru_clean_mappings(struct cache_c * dmc)
+{
+	struct rb_node * node = rb_first(dmc->sources);
+	struct rb_node * next;
+	struct mapping * mapping;
+	struct mapping * lru;
+
+	//printk("lru_clean_mappings\n");
+
+	lru = NULL;
+
+	while(node)
+	{
+		next = rb_next(node);
+		mapping = rb_entry(node, struct mapping, node);
+
+		if(mapping->dirty == 0 && (!lru || mapping->timestamp < lru->timestamp))
+		{
+			lru = mapping;
+		}
+
+		node = next;
+	}
+
+	if(!lru)
+	{
+		return NULL;
+	}
+	else
+	{
+		return lru;
+	}
+}
+
+static struct mapping * lru_dirty_mappings(struct cache_c * dmc)
+{
+	struct rb_node * node = rb_first(dmc->sources);
+	struct rb_node * next;
+	struct mapping * mapping;
+	struct mapping * lru;
+
+	//printk("lru_dirty_mappings\n");
+
+	lru = NULL;
+
+	while(node)
+	{
+		next = rb_next(node);
+		mapping = rb_entry(node, struct mapping, node);
+
+		if(mapping->dirty == 1 && (!lru || mapping->timestamp < lru->timestamp))
+		{
+			lru = mapping;
+		}
+
+		node = next;
+	}
+
+	if(!lru)
+	{
+		return NULL;
+	}
+	else
+	{
+		return lru;
+	}
+}
+
+static void lru_fingerprints(struct cache_c * dmc)
+{
+	struct rb_node * node = rb_first(dmc->fingerprints);
+	struct rb_node * next;
+	struct fingerprint * fingerprint;
+	struct fingerprint * lru;
+
+	lru = NULL;
+
+	//printk("count: %u, max: %u\n", dmc->fingerprint_count, dmc->max_fingerprints);
+
+	if(dmc->fingerprint_count < dmc->max_fingerprints)
+	{
+		return;
+	}
+
+	//printk("LRU Fingerprints\n");
+
+	while(node)
+	{
+		next = rb_next(node);
+		fingerprint = rb_entry(node, struct fingerprint, node);
+
+		if(!lru || fingerprint->timestamp < lru->timestamp)
+		{
+			lru = fingerprint;
+		}
+
+		node = next;
+	}
+
+	if(!lru)
+	{
+		return;
+	}
+	else
+	{
+		//printk("Emptying a fingerprint\n");
+		rb_erase(&lru->node, dmc->fingerprints);
+		dmc->fingerprint_count--;
+		remove_all_identifiers(fingerprint);
+		dest_fingerprint(fingerprint);
+	}
+}
+
+static void cacheblock_clear_all(struct cache_c * dmc, sector_t cache_block)
+{
+	struct cacheblock *cache = dmc->cache;
+	struct fingerprint * fingerprint;
+
+	//printk("Beginning\n");
+
+	clean_cacheblock(dmc, &cache[cache_block]);
+
+	if(!cache[cache_block].hash)
+	{
+		//printk("Returning due to null hash\n");
+		return;
+	}	
+
+	fingerprint = lookup(dmc, cache[cache_block].hash);
+
+	if(fingerprint)
+	{
+		/* Problem!! */
+		remove_identifier(dmc, fingerprint, cache_block);
+	}
+
+	if(cache[cache_block].hash)
+	{
+		//printk("removing hash\n");
+		kfree(cache[cache_block].hash);
+	}
+
+	//printk("Ending\n");
+}
+
+/* Get the MD5 hash of a block of data from the source device */
+static int hash(struct bio * bio, unsigned char * result, struct cache_c * dmc)
+{
+  struct scatterlist sg;
+  struct crypto_hash *tfm;
+  struct hash_desc desc;
+  unsigned char buffer[dmc->block_size * 512];
+  unsigned int i, size, length;
+  struct page * cpy;
+  struct bio_vec * bvec;
+  int segno;
+  unsigned char * temp_data; 
+  unsigned char * write_data; 
+
+  //printk("hashing data\n");
+
+  size = dmc->block_size * 512;
+  length = 0;
+  write_data = NULL;
+
+  memset(result, 0x00, 16);
+
+  bio_for_each_segment(bvec, bio, segno)
+  {
+    if(segno == 0)
+    {
+	cpy = bio_page(bio);
+	kmap(cpy);
+	write_data = (unsigned char *)page_address(cpy);
+	kunmap(cpy);
+        length += bvec->bv_len;
+    }
+    else
+    {
+	cpy = bio_page(bio);
+	kmap(cpy);
+	temp_data = strcat(write_data, (unsigned char *)page_address(cpy));
+	kunmap(cpy);
+	write_data = temp_data;
+	length += bvec->bv_len;
+    }
+  }
+
+  for(i = 0; i < length; i++)
+  {
+     buffer[i] = write_data[i];
+  }
+
+  tfm = crypto_alloc_hash("md5", 0, CRYPTO_ALG_ASYNC);
+
+  desc.tfm = tfm;
+  desc.flags = 0;
+
+  sg_init_one(&sg, buffer, size);
+  crypto_hash_init(&desc);
+
+  crypto_hash_update(&desc, &sg, size);
+  crypto_hash_final(&desc, result);
+  crypto_free_hash(tfm);
+
+  return 0;
+}
+
+/* Compare data from a bio with data stored in the cache device */
+static int compare_data(sector_t location, struct bio * bio, struct cache_c * dmc)
+{
+	struct dm_io_region where;
+	unsigned long bits;
+	int segno;
+	struct bio_vec * bvec;
+	struct page * page;
+	unsigned char * cache_data;
+        unsigned char * temp_data;
+	unsigned char * write_data;
+	int result, length;
+	result = 0;
+
+	//printk("compare_data\n");
+
+	cache_data = (unsigned char *)vmalloc((dmc->block_size * 512) + 1);
+
+	where.bdev = dmc->cache_dev->bdev;
+	where.count = dmc->block_size;
+	where.sector = location << dmc->block_shift;
+
+	dm_io_sync_vm(1, &where, READ, cache_data, &bits, dmc);
+
+	length = 0;
+
+	bio_for_each_segment(bvec, bio, segno)
+	{
+		if(segno == 0)
+		{
+			page = bio_page(bio);
+			kmap(page);
+			write_data = (unsigned char *)page_address(page);
+			kunmap(page);
+                        length += bvec->bv_len;
+		}
+		else
+		{
+			page = bio_page(bio);
+			kmap(page);
+			temp_data = strcat(write_data, (unsigned char *)page_address(page));
+			kunmap(page);
+			write_data = temp_data;
+			length += bvec->bv_len;
+		}
+	}
+
+	cache_data[dmc->block_size * 512] = '\0';
+	
+	result = memcmp(write_data, cache_data, length);
+	vfree(cache_data);
+
+	return result;	
+}
+
+/* Compare data with matching fingerprints */
+static struct identifier * match_caches(struct cache_c * dmc, struct bio * bio, struct fingerprint * fingerprint)
+{
+	struct rb_node * node = fingerprint->caches->rb_node;
+	struct identifier * id;
+	int comparison;
+
+	//printk("matches_caches\n");
+
+	while(node)
+	{
+		id = rb_entry(node, struct identifier, node);
+		comparison = compare_data(id->cache, bio, dmc);		
+
+		if(comparison < 0)
+		{
+			node = node->rb_left;
+		}
+		else if(comparison > 0)
+		{
+			node = node->rb_right;
+		}
+		else
+		{
+			return id;
+		}
+	}
+
+	return NULL;
+}
+
+static int has_many_references(struct cacheblock * cacheblock)
+{
+	//printk("has_many_references\n");
+	return (cacheblock->references > 1) ? 1 : 0;
+}
 
 /****************************************************************************
  * Functions for asynchronously fetching data from source device and storing
@@ -428,7 +1364,7 @@ static int do_fetch(struct kcached_job *job)
 	unsigned int offset, head, tail, remaining, nr_vecs, idx = 0;
 	struct bio_vec *bvec;
 	struct page_list *pl;
-	printk("do_fetch");
+	//printk("do_fetch");
 	offset = (unsigned int) (bio->bi_sector & dmc->block_mask);
 	head = to_bytes(offset);
 	tail = to_bytes(dmc->block_size) - bio->bi_size - head;
@@ -436,6 +1372,8 @@ static int do_fetch(struct kcached_job *job)
 	DPRINTK("do_fetch: %llu(%llu->%llu,%llu), head:%u,tail:%u",
 	        bio->bi_sector, job->src.sector, job->dest.sector,
 	        job->src.count, head, tail);
+
+	//printk("do_fetch\n");
 
 	if (bio_data_dir(bio) == READ) { /* The original request is a READ */
 		if (0 == job->nr_pages) { /* The request is aligned to cache block */
@@ -549,83 +1487,10 @@ static int do_fetch(struct kcached_job *job)
 		job->bvec = bvec;
 		r = dm_io_async_bvec(1, &job->src, READ, job->bvec + idx,
 		                     io_callback, job);
-		printk("do_fetch end\n");
+		printk("do_fetch end");
 
 		return r;
 	}
-}
-
-/*Computes the md5 hash of an arbitrary amount of data*/
-
-int get_fingerprint(struct bio * bio, unsigned char * result)
-{
-	struct scatterlist sg[bio->bi_vcnt]; 
-	unsigned int i, len;
-	struct page * cpy;
-	struct bio_vec * bvec;
-
-	struct hash_desc desc = {
-	.tfm = crypto_alloc_hash("md5", 0, CRYPTO_ALG_ASYNC),
-	.flags = CRYPTO_TFM_REQ_MAY_SLEEP
-	};
-
-	sg_init_table(sg, ARRAY_SIZE(sg));
-	crypto_hash_init(&desc);
-
-	for(i = 0; i < bio->bi_vcnt; i++)  
-	{
-		bvec = &bio->bi_io_vec[i];
-		cpy = bvec->bv_page;
-		len = bvec->bv_len;
-		printk("The length of this buffer is %d\n", len);
-		kmap(cpy);
-
-		sg_set_buf(&sg[i], page_address(cpy), len); 
-		crypto_hash_update(&desc, &sg, len); 
-		kunmap(cpy); 
-	}
-
-	crypto_hash_final(&desc, result);
-
-	crypto_free_hash(desc.tfm);
-
-	for(i = 0; i < 16; i++)
-	{
-		printk("%02x", result[i]);
-	}
-
-	printk("\n");	
-	return 0;
-}
-
-/* This function will compare two blocks of data and return -n , 0, or n based on how they match up. */
-
-int data_compare(sector_t location, struct bio * bio, unsigned char * data, struct cache_c * dmc)
-{
-	struct page * cpy;
-	struct bio_vec * bvec;
-	struct dm_io_region where;
-	unsigned long bits;
-	int ret, i;
-
-	where.bdev = dmc->cache_dev->bdev;
-	where.count = dmc->block_size;
-	where.sector = location << dmc->block_shift;
-
-	dm_io_sync_vm(1, &where, READ, data, &bits, dmc);
-
-	//Can make a loop to deal with bios that carry more than 4k of data
-	bvec = &bio->bi_io_vec[0];
-	cpy = bvec->bv_page;
-	kmap(cpy);
-
-	data[dmc->block_size * 512] = '\0';
-
-	ret = memcmp(page_address(cpy), data, dmc->block_size * 512);
-
-	kunmap(cpy);
-
-	return ret;
 }
 
 /*
@@ -640,14 +1505,17 @@ static int do_store(struct kcached_job *job)
 	int i, j, r = 0;
 	struct bio *bio = job->bio ;
 	struct cache_c *dmc = job->dmc;
-	struct cacheblock *cache = dmc->cache;
+	struct cacheblock *cacheblock = dmc->cache;
 	unsigned int offset, head, tail, remaining, nr_vecs;
-	int l; 
-	struct fingerprint_store * fingerprint_store; 
 	struct bio_vec *bvec;
-	int check_block;
-	unsigned char * fingerprint; //For storing the fingerprint
-	unsigned char * bdata; //For block comparison
+	int sector_size, dirty;
+	sector_t cache; /* selected cache sector */
+	unsigned char * hash_string; /* Holds the hash of the bio data */
+	struct fingerprint * fingerprint;
+	struct identifier * id;
+	struct mapping * mapping;
+	struct block_metadata * bmd;
+	unsigned long err;
 	offset = (unsigned int) (bio->bi_sector & dmc->block_mask);
 	head = to_bytes(offset);
 	tail = to_bytes(dmc->block_size) - bio->bi_size - head;
@@ -656,99 +1524,98 @@ static int do_store(struct kcached_job *job)
 	        bio->bi_sector, job->src.sector, job->dest.sector,
 	        job->src.count, head, tail);
 
-	   //Deduplication begins here
+	/* Dedup code begins here */
 
-	   if(bio->bi_size >= 4096)
-	   {
-		//Allocate space for the fingerprint
-		fingerprint = kmalloc(sizeof(unsigned char) * 16, GFP_KERNEL);
+	sector_size = 512;
 
-		//Store the calculated fingerprint in the allocated space
-		get_fingerprint(bio, fingerprint); 
+	//printk("do_store\n");
 
-		//Look up the fingerprint in the fingerprint store
-		fingerprint_store = search_fingerprint_list(f_list, fingerprint);
+	/* Checking for the right size */
+	if(bio->bi_size >= (dmc->block_size * sector_size))
+	{
+		dmc->considered++;
 
-		if(fingerprint_store != NULL)
+		cache = job->dest.sector >> dmc->block_shift;
+
+		if(bio_data_dir(bio) == READ)
 		{
+			dirty = 0;
+		}
+		else
+		{
+			printk("do store write for source: %llu and cache: %llu\n", job->src.sector, cache);
+			dirty = 1;
+		}
 
-		   //For each cacheblock with this fingerprint, perform a comparison
-		   //between the bio data and the data in the cacheblock
-		   for(l = 0; l < fingerprint_store->max_length; l++)
-		   {
-			//space for loading cacheblock data into memory
-			bdata = (unsigned char *)vmalloc((dmc->block_size * 512) + 1);	
+		hash_string = kmalloc(sizeof(*hash_string) * 16, GFP_KERNEL);
 		
-			//compare the data, returns a negative, 0 (same), or positive number
-			check_block = data_compare(fingerprint_store->cachelist[l], bio, bdata, dmc);
-		
-			printk("Block Comparison: %d\n", check_block);
+		if(!hash_string)
+		{
+			//printk("Memory not enough\n");
+		}
 
-			if(check_block == 0)
+		hash(bio, hash_string, dmc);  /* Hash the bio data */
+		fingerprint = lookup(dmc, hash_string); /* Look up the hash in the fingerprint tree */
+		
+		if(!fingerprint) /* No matching hash found in the tree */
+		{
+			dmc->new_data++;
+
+			//lru_fingerprints(dmc);
+			fingerprint = init_fingerprint(hash_string);
+			id = init_identifier(cache);
+			add_identifier(fingerprint, id);
+			add_fingerprint(fingerprint, dmc);
+			//lru_mappings(dmc);
+			mapping = init_mapping(job->src.sector, cache, dirty);
+			add_mapping(dmc, mapping);
+			bmd = init_block_metadata(job->src.sector, dirty);
+			add_block_metadata(dmc, bmd, job->cacheblock);
+			job->cacheblock->hash = hash_string;
+		}
+		else
+		{
+			/* Matching fingerprints found. Need to do direct data comparison */
+			dmc->matches++;
+
+			id = match_caches(dmc, bio, fingerprint);
+
+			if(id) /* Found and exact match */
 			{
-			   //The data in the bio matched the cacheblock			   
+				dmc->deduped++;
 
-			   vfree(bdata);
+				update_fingerprint(fingerprint);
+				//lru_mappings(dmc);
+				mapping = init_mapping(job->src.sector, id->cache, dirty);
+				add_mapping(dmc, mapping);
+				bmd = init_block_metadata(job->src.sector, dirty);
+				add_block_metadata(dmc, bmd, &cacheblock[id->cache]);
+				kfree(hash_string);
 
-			   //Add the source sector and destination cache block to the sector map
-			   insert_into_sector_map_list(m_list, job->src.sector, fingerprint_store->cachelist[l]);
-
-			   bio->bi_bdev = dmc->cache_dev->bdev;
-			   bio->bi_sector = (fingerprint_store->cachelist[l] << dmc->block_shift) + offset;
-			   spin_lock(&cache[fingerprint_store->cachelist[l]].lock);
-
-			   //Update the cache block's list of referencing source sectors
-			   if(cache[fingerprint_store->cachelist[l]].s_list == NULL)
-			   {
-			      cache[fingerprint_store->cachelist[l]].s_list = init_sector_status_list(job->src.sector, 0);
-			   }
-			   else
-			   {
-			      insert_sector_status(cache[fingerprint_store->cachelist[l]].s_list, job->src.sector, 0);
-			   }
-
-			   //Dump the prematurely allocated cache block from cache_map
-
-			   spin_unlock(&cache[fingerprint_store->cachelist[l]].lock);
-			   job->cacheblock->loss = 1;
-			   push(&_complete_jobs, job);
-			   wake();
-			   return 0;
+				io_callback(err, job);
+				return 0;
 			}
-
-			vfree(bdata);
-		   }
-
+			else /* Rare case: Same fingerprint, different content */
+			{
+				id = init_identifier(cache);
+				add_identifier(fingerprint, id);
+				update_fingerprint(fingerprint);
+				//lru_mappings(dmc);
+				mapping = init_mapping(job->src.sector, cache, dirty);
+				add_mapping(dmc, mapping);
+				bmd = init_block_metadata(job->src.sector, dirty);
+				add_block_metadata(dmc, bmd, job->cacheblock);
+				job->cacheblock->hash = hash_string;
+			}
 		}
+	}
 
-		{
-		   //The fingerprint was not found in the fingerprint store or none of the potential cacheblocks were an exact match
+	/* Dedup code ends here */
 
-		   //Insert the fingerprint and the new cacheblock into the fingerprint store. If the fingerprint already exists, only the cacheblock is added
-		   insert_into_fingerprint_list(f_list, fingerprint, (job->dest.sector >> dmc->block_shift));
-		   //Insert the source sector and destination sector into the sector map
-		   insert_into_sector_map_list(m_list, job->src.sector, (job->dest.sector >> dmc->block_shift));
-		   job->cacheblock->fingerprint = fingerprint;
 
-		   //Update the cacheblock's lsit of referencing source sectors
-		   if(job->cacheblock->s_list == NULL)
-		   {
-			job->cacheblock->s_list = init_sector_status_list(job->src.sector, 0);
-		   }
-		   else
-		   {
-		      insert_sector_status(job->cacheblock->s_list, job->src.sector, 0);
-		   }
-		}
-	   }
-
-	if (0 == job->nr_pages)
-	{ /* Original request is aligned with cache blocks */
+	if (0 == job->nr_pages) /* Original request is aligned with cache blocks */
 		r = dm_io_async_bvec(1, &job->dest, WRITE, bio->bi_io_vec + bio->bi_idx,
 		                     io_callback, job);
-		store_count++;
-		printk("Storage Count: %d\n", store_count);
-	}
 	else {
 		if (bio_data_dir(bio) == WRITE && head > 0 && tail > 0) {
 			DPRINTK("Special case: %lu %u %u", bio_data_dir(bio), head, tail);
@@ -793,8 +1660,6 @@ static int do_store(struct kcached_job *job)
 		}
 
 		r = dm_io_async_bvec(1, &job->dest, WRITE, job->bvec, io_callback, job);
-		store_count++;
-		printk("Storage Count: %d\n", store_count);
 	}
 	return r;
 }
@@ -815,6 +1680,8 @@ static int do_io(struct kcached_job *job)
 static int do_pages(struct kcached_job *job)
 {
 	int r = 0;
+
+	printk("Do pages? \n");
 
 	r = kcached_get_pages(job->dmc, job->nr_pages, &job->pages);
 
@@ -837,25 +1704,27 @@ static void flush_bios(struct cacheblock *cacheblock)
 	spin_lock(&cacheblock->lock);
 	bio = bio_list_get(&cacheblock->bios);
 	if (is_state(cacheblock->state, WRITEBACK)) { /* Write back finished */
-		cacheblock->state = VALID;
-	} 
-	else 
-	{ 
-		if(cacheblock->loss == 0)
+        
+		/* Some dedup code here */
+	
+		if(cacheblock->dirty_references > 0)
 		{
-			set_state(cacheblock->state, VALID);
-			clear_state(cacheblock->state, RESERVED);
+			cacheblock->dirty_references--;
+			spin_unlock(&cacheblock->lock);
+			return;
 		}
 		else
 		{
-			//Invalidating prematurely allocated block from do_store
-			cacheblock->loss = 0;
-			cacheblock->s_list = NULL;
-			cacheblock->state = 0;
+			cacheblock->state = VALID;
 		}
-	}
 
+	} else { /* Cache insertion finished */
+		set_state(cacheblock->state, VALID);
+		clear_state(cacheblock->state, RESERVED);
+	}
 	spin_unlock(&cacheblock->lock);
+
+	//printk("Flushing bios\n");
 
 	while (bio) {
 		n = bio->bi_next;
@@ -1000,6 +1869,8 @@ static void write_back(struct cache_c *dmc, sector_t index, unsigned int length)
 
 	DPRINTK("Write back block %llu(%llu, %u)",
 	        index, cacheblock->block, length);
+	printk("Write back block cache %llu(source %llu, %u)\n",
+	        				index, cacheblock->block, length);
 	src.bdev = dmc->cache_dev->bdev;
 	src.sector = index << dmc->block_shift;
 	src.count = dmc->block_size * length;
@@ -1013,6 +1884,128 @@ static void write_back(struct cache_c *dmc, sector_t index, unsigned int length)
 	copy_block(dmc, src, dest, cacheblock);
 }
 
+/*static void write_back(struct cache_c *dmc, sector_t index, unsigned int length)
+{
+	struct dm_io_region src, dest;
+	struct cacheblock *cacheblock = &dmc->cache[index];
+	unsigned int i, j;
+	sector_t source;
+
+	for (i=0; i<length; i++)
+	{
+		if(dmc->cache[index + i].dirty_references > 0)
+    		{
+			j = cacheblock->dirty_references;
+			set_state(dmc->cache[index+i].state, WRITEBACK);
+
+			while(j)
+			{
+				source = get_dirty_sector(dmc, cacheblock);
+
+				if(source)
+				{
+					DPRINTK("Write back block %llu(%llu, %u)",
+	        				index + i, source, 1);
+					printk("Write back block cache %llu(source %llu, %u)\n",
+	        				index + i, source, 1);
+					src.bdev = dmc->cache_dev->bdev;
+					src.sector = (index + i) << dmc->block_shift;
+					src.count = dmc->block_size;
+					dest.bdev = dmc->src_dev->bdev;
+					dest.sector = source;
+					dest.count = dmc->block_size;
+					dmc->dirty_blocks--;
+					copy_block(dmc, src, dest, cacheblock);
+					j--;
+				}
+				else
+				{
+					j = 0;
+				}
+			}
+		}
+		else
+		{
+			DPRINTK("Write back block %llu(%llu, %u)",
+	        		index, cacheblock->block, 1);
+			printk("Write back block cache %llu(source %llu, %u)\n",
+	        				index + i, cacheblock->block, 1);
+			src.bdev = dmc->cache_dev->bdev;
+			src.sector = (index + i) << dmc->block_shift;
+			src.count = dmc->block_size;
+			dest.bdev = dmc->src_dev->bdev;
+			dest.sector = cacheblock->block;
+			dest.count = dmc->block_size;
+			set_state(dmc->cache[index+i].state, WRITEBACK);
+			dmc->dirty_blocks--;
+			copy_block(dmc, src, dest, cacheblock);
+		}
+	}
+}*/
+
+static void write_back_dedup(struct cache_c *dmc, sector_t index, unsigned int length)
+{
+	struct dm_io_region src, dest;
+	struct cacheblock *cacheblock = &dmc->cache[index];
+	unsigned int i;
+	sector_t source;
+
+	source = get_dirty_sector(dmc, cacheblock);
+
+	DPRINTK("Write back block %llu(%llu, %u)",
+	        index, cacheblock->block, length);
+	printk("Write back block dedup cache %llu(source %llu, %u)\n",
+	        				index, source, length);
+
+	src.bdev = dmc->cache_dev->bdev;
+	src.sector = index << dmc->block_shift;
+	src.count = dmc->block_size * length;
+	dest.bdev = dmc->src_dev->bdev;
+	dest.sector = source;
+	dest.count = dmc->block_size * length;
+
+	for (i=0; i<length; i++)
+		set_state(dmc->cache[index+i].state, WRITEBACK);
+	dmc->dirty_blocks -= length;
+	copy_block(dmc, src, dest, cacheblock);
+}
+
+static void lru_mappings(struct cache_c * dmc)
+{
+	struct cacheblock *cache = dmc->cache;
+	struct mapping * lru;
+	int is_dirty;
+
+	if(dmc->source_count == dmc->max_sources)
+	{
+		//printk("LRU Mappings\n");
+		lru = lru_clean_mappings(dmc);
+
+		if(!lru)
+		{
+			lru = lru_dirty_mappings(dmc);
+			is_dirty = 1;
+		}
+		else
+		{
+			is_dirty = 0;
+		}
+
+		if(lru)
+		{
+			//printk("Emptying a mapping\n");
+			if(is_dirty)
+			{
+				write_back(dmc, lru->cache, 1);
+			}
+
+			remove_block_metadata(&cache[lru->cache], lru->source);
+			rb_erase(&lru->node, dmc->sources);
+			kfree(lru);
+			dmc->source_count--;
+		}
+	}
+}
 
 /****************************************************************************
  *  Functions for implementing the various cache operations.
@@ -1078,6 +2071,8 @@ static int cache_lookup(struct cache_c *dmc, sector_t block,
 	int invalid = -1, oldest = -1, oldest_clean = -1;
 	unsigned long counter = ULONG_MAX, clean_counter = ULONG_MAX;
 
+	//printk("cache_lookup\n");
+
 	index=set_number * cache_assoc;
 
 	for (i=0; i<cache_assoc; i++, index++) {
@@ -1124,8 +2119,10 @@ static int cache_lookup(struct cache_c *dmc, sector_t block,
 	}
 
 	if (-1 == res)
+	{
 		DPRINTK("Cache lookup: Block %llu(%lu):%s",
 	            block, set_number, "NO ROOM");
+	}
 	else
 		DPRINTK("Cache lookup: Block %llu(%lu):%llu(%s)",
 		        block, set_number, *cache_block,
@@ -1146,9 +2143,14 @@ static int cache_insert(struct cache_c *dmc, sector_t block,
 	 */
 	cache[cache_block].block = block;
 	cache[cache_block].state = RESERVED;
-	cache[cache_block].s_list = NULL;
 	if (dmc->counter == ULONG_MAX) cache_reset_counter(dmc);
 	cache[cache_block].counter = ++dmc->counter;
+
+	/* Dedup code begins here */
+	cache[cache_block].references = 0;
+	cache[cache_block].dirty_references = 0;
+	cache[cache_block].hash = NULL;
+	/* Dedup code ends here */
 
 	return 1;
 }
@@ -1158,44 +2160,17 @@ static int cache_insert(struct cache_c *dmc, sector_t block,
  */
 static void cache_invalidate(struct cache_c *dmc, sector_t cache_block)
 {
-	int i;
-	sector_t source;
 	struct cacheblock *cache = dmc->cache;
 
 	DPRINTK("Cache invalidate: Block %llu(%llu)",
 	        cache_block, cache[cache_block].block);
-
-	/*We have to remove any references to this cache block from the sector map,
-	  and the fingerprint store */
-
-	if(cache[cache_block].s_list != NULL)
-	{
-		//For every source sector referenced in the cacheblock, remove it from the sector map
-		for(i = 0; i < cache[cache_block].s_list->max_length; i++)
-		{
-			source = source_sector_at_index(cache[cache_block].s_list, i)->source_sector;
-
-	   		if(source > -1)
-			{
-				printk("Removing sector %llu from the sector map\n", (unsigned long long)source);
-				remove_from_sector_map_list(m_list, source);
-			}
-		}
-
-		cache[cache_block].s_list = NULL;
-	}
-
-	remove_from_sector_map_list(m_list, cache[cache_block].block);
-
-	//Remove any reference to the cacheblock from the fingerprint store
-	if(cache[cache_block].fingerprint != NULL)
-	{
-	        printk("Clearing a fingerprint from the fingerprint store\n");
-		remove_from_fingerprint_list(f_list, cache[cache_block].fingerprint, cache_block);
-		cache[cache_block].fingerprint = NULL;
-	}
-
 	clear_state(cache[cache_block].state, VALID);
+
+	/* Dedup code begins here */
+
+	cacheblock_clear_all(dmc, cache_block);
+
+	/* Dedup code ends here */
 }
 
 /*
@@ -1212,15 +2187,18 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 	struct cacheblock *cache = dmc->cache;
 
 	dmc->cache_hits++;
+	//printk("cache_hit\n");
 
 	if (bio_data_dir(bio) == READ) { /* READ hit */
 		bio->bi_bdev = dmc->cache_dev->bdev;
 		bio->bi_sector = (cache_block << dmc->block_shift)  + offset;
+		//printk("read hit\n");
 
 		spin_lock(&cache[cache_block].lock);
 
 		if (is_state(cache[cache_block].state, VALID)) { /* Valid cache block */
 			spin_unlock(&cache[cache_block].lock);
+			//printk("valid block\n");
 			return 1;
 		}
 
@@ -1232,6 +2210,7 @@ static int cache_hit(struct cache_c *dmc, struct bio* bio, sector_t cache_block)
 		spin_unlock(&cache[cache_block].lock);
 		return 0;
 	} else { /* WRITE hit */
+		//printk("write hit\n");
 		if (dmc->write_policy == WRITE_THROUGH) { /* Invalidate cached data */
 			cache_invalidate(dmc, cache_block);
 			bio->bi_bdev = dmc->src_dev->bdev;
@@ -1313,6 +2292,8 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 	struct kcached_job *job;
 	sector_t request_block, left;
 
+	//printk("cache_read_miss\n");
+
 	offset = (unsigned int)(bio->bi_sector & dmc->block_mask);
 	request_block = bio->bi_sector - offset;
 
@@ -1320,6 +2301,8 @@ static int cache_read_miss(struct cache_c *dmc, struct bio* bio,
 		DPRINTK("Replacing %llu->%llu",
 		        cache[cache_block].block, request_block);
 		dmc->replace++;
+		cacheblock_clear_all(dmc, cache_block);
+		//printk("valid block\n");
 	} else DPRINTK("Insert block %llu at empty frame %llu",
 		request_block, cache_block);
 
@@ -1363,6 +2346,8 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 	struct kcached_job *job;
 	sector_t request_block, left;
 
+	//printk("cache_write_miss\n");
+
 	if (dmc->write_policy == WRITE_THROUGH) { /* Forward request to souuce */
 		bio->bi_bdev = dmc->src_dev->bdev;
 		return 1;
@@ -1375,11 +2360,14 @@ static int cache_write_miss(struct cache_c *dmc, struct bio* bio, sector_t cache
 		DPRINTK("Replacing %llu->%llu",
 		        cache[cache_block].block, request_block);
 		dmc->replace++;
+		cacheblock_clear_all(dmc, cache_block);
+		//printk("valid block\n");
 	} else DPRINTK("Insert block %llu at empty frame %llu",
 		request_block, cache_block);
 
 	/* Write delay */
 	cache_insert(dmc, request_block, cache_block); /* Update metadata first */
+	printk("cache %llu is becoming dirty.\n", cache_block);
 	set_state(cache[cache_block].state, DIRTY);
 	dmc->dirty_blocks++;
 
@@ -1437,9 +2425,10 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 		      union map_info *map_context)
 {
 	struct cache_c *dmc = (struct cache_c *) ti->private;
+	struct cacheblock *cacheblocks = dmc->cache;
 	sector_t request_block, cache_block = 0, offset;
-	int res;
-	struct sector_map * map;
+	int res, sector_size;
+	sector_t cache;
 
 	offset = bio->bi_sector & dmc->block_mask;
 	request_block = bio->bi_sector - offset;
@@ -1452,27 +2441,45 @@ static int cache_map(struct dm_target *ti, struct bio *bio,
 	if (bio_data_dir(bio) == READ) dmc->reads++;
 	else dmc->writes++;
 
-	/*Look up the request sector in the sector map. If it is found, then we
-	can call a cache hit on its cache location according to the map.*/
+	//printk("cache_map\n");
 
-   	if(bio->bi_size >= 4096)
-   	{
-		map = search_sector_map_list(m_list, request_block);
+	/* Dedup code begins here */
+	sector_size = 512;
 
-		if(map != NULL)
+	/* We only operate on blocks that are the right size */
+	if(bio->bi_size >= (dmc->block_size * sector_size))
+	{
+		cache = map_sectors(dmc, request_block);
+
+		if(cache != 0) /* There is an existing mapping for the source sector */
 		{
-			//The request sector was found in the map.
-
-			printk(KERN_INFO "Cacheblock %llu found for sector %llu\n", (unsigned long long)map->cache_sector, (unsigned long long)bio->bi_sector);
-			return cache_hit(dmc, bio, map->cache_sector);
+			if(bio_rw(bio) == READ)
+			{
+				return cache_hit(dmc, bio, cache);
+			}
+			else
+			{
+				printk("write with source: %llu and cache: %llu\n", request_block, cache);
+				/* We have to check the number of references to the selected cacheblock */
+				if(has_many_references(&cacheblocks[cache]))
+				{
+					/* No cache hit. We must eliminate the mapping between this source and cache.
+					   We must not overwrite a cacheblock that there are multiple references to.
+					*/
+					dmc->redirects++;
+					
+					remove_block_metadata(&cacheblocks[cache], request_block);
+					remove_mapping(dmc, request_block);
+				}
+				else
+				{
+					return cache_hit(dmc, bio, cache);
+				}
+			}
 		}
-		else
-		{
-			//The request sector was not found.
-
-			printk(KERN_INFO "Sector %llu not found.\n", (unsigned long long)bio->bi_sector);
-		}
-   	}	
+	}
+	
+	/* End of dedup code */
 
 	res = cache_lookup(dmc, request_block, &cache_block);
 	if (1 == res)  /* Cache hit; server request from cache */
@@ -1860,11 +2867,19 @@ init:	/* Initialize the cache structs */
 		bio_list_init(&dmc->cache[i].bios);
 		if(!persistence) dmc->cache[i].state = 0;
 		dmc->cache[i].counter = 0;
-		dmc->cache[i].fingerprint = NULL;
-		dmc->cache[i].loss = 0;
-		dmc->cache[i].s_list = NULL;
 		spin_lock_init(&dmc->cache[i].lock);
+		dmc->cache[i].blocks = kmalloc(sizeof(dmc->cache[i].blocks), GFP_KERNEL);
+		*dmc->cache[i].blocks = RB_ROOT;
+		dmc->cache[i].references = 0;
+		dmc->cache[i].dirty_references = 0;
+		dmc->cache[i].hash = NULL;
 	}
+
+	dmc->fingerprints = kmalloc(sizeof(dmc->fingerprints), GFP_KERNEL);
+	dmc->sources = kmalloc(sizeof(dmc->sources), GFP_KERNEL);
+
+	*dmc->fingerprints = RB_ROOT;
+	*dmc->sources = RB_ROOT;
 
 	dmc->counter = 0;
 	dmc->dirty_blocks = 0;
@@ -1874,6 +2889,20 @@ init:	/* Initialize the cache structs */
 	dmc->replace = 0;
 	dmc->writeback = 0;
 	dmc->dirty = 0;
+
+	/* Dedup stats */
+	dmc->considered = 0;	
+	dmc->new_data = 0;		
+	dmc->matches = 0;		
+	dmc->deduped = 0;		
+	dmc->redirects = 0;
+
+	/* Map Limits */
+	dmc->max_sources = dmc->size / 4;
+	dmc->max_fingerprints = dmc->size / 4;
+
+	dmc->source_count = 0;
+	dmc->fingerprint_count = 0;
 
 	ti->split_io = dmc->block_size;
 	ti->private = dmc;
@@ -1900,19 +2929,37 @@ static void cache_flush(struct cache_c *dmc)
 {
 	struct cacheblock *cache = dmc->cache;
 	sector_t i = 0;
-	unsigned int j;
+	unsigned int j, k;
 
 	DMINFO("Flush dirty blocks (%llu) ...", (unsigned long long) dmc->dirty_blocks);
 	while (i< dmc->size) {
 		j = 1;
 		if (is_state(cache[i].state, DIRTY)) {
-			while ((i+j) < dmc->size && is_state(cache[i+j].state, DIRTY)
+			/*while ((i+j) < dmc->size && is_state(cache[i+j].state, DIRTY)
 			       && (cache[i+j].block == cache[i].block + j *
 			       dmc->block_size)) {
 				j++;
+			}*/
+
+			printk("cache %llu is dirty.\n", i);
+
+			if(cache[i].dirty_references > 0)
+			{
+				k = cache[i].dirty_references;
+				printk("cache %llu has %d dirty references.\n", i, k);
+
+				while(k)
+				{
+					dmc->dirty += j;
+					write_back_dedup(dmc, i, j);
+					k--;
+				}
 			}
-			dmc->dirty += j;
-			write_back(dmc, i, j);
+			else
+			{
+				dmc->dirty += j;
+				write_back(dmc, i, j);
+			}
 		}
 		i += j;
 	}
@@ -1924,8 +2971,28 @@ static void cache_flush(struct cache_c *dmc)
 static void cache_dtr(struct dm_target *ti)
 {
 	struct cache_c *dmc = (struct cache_c *) ti->private;
+	int i;
 
 	if (dmc->dirty_blocks > 0) cache_flush(dmc);
+
+	/* Dedup code begins here */
+
+	for (i=0; i<dmc->size; i++) 
+	{
+		if(dmc->cache[i].references > 0)
+		{
+			//printk("selected cache %d for %d refs\n", i, dmc->cache[i].references);
+			cacheblock_clear_all(dmc, i);
+			kfree(dmc->cache[i].blocks);
+		}
+	}
+	
+	//remove_all_mappings(dmc);
+	//remove_all_fingerprints(dmc);
+	kfree(dmc->sources);
+	kfree(dmc->fingerprints);
+
+	/* Dedup code ends here */
 
 	kcached_client_destroy(dmc);
 
@@ -1957,56 +3024,16 @@ static int cache_status(struct dm_target *ti, status_type_t type,
 			 char *result, unsigned int maxlen)
 {
 	struct cache_c *dmc = (struct cache_c *) ti->private;
-	struct cacheblock *cache = dmc->cache;
 	int sz = 0;
-	int val = 0;
-	int inval = 0;
-	int reser = 0;
-	int dirt = 0;
-	int wrtbck = 0;
-	int nothing = 0;
-	sector_t i = 0;
-
-	printk("dmc size: %llu", (unsigned long long)dmc->size);
-
-	for(i = 0; i < dmc->size; i++)
-	{
-		if(cache[i].state == 1) //1
-		{
-			val++;
-		}
-		else if(cache[i].state == 0) //0
-		{
-			inval++;
-		}
-		else if(cache[i].state == 2) //2
-		{
-			reser++;
-		}
-		else if(cache[i].state == 4) //4
-		{
-			dirt++;
-		}
-		else if(cache[i].state == 8) //8
-		{
-			wrtbck++;
-		}
-		else
-		{
-			nothing++;
-		}
-	}
-
-	printk("\n Valid: %i\n Invalid: %i\n Reserved: %i\n Dirty: %i\n Writeback: %i\n", val, inval, reser, dirt, wrtbck);
 
 	switch (type) {
 	case STATUSTYPE_INFO:
-		DMEMIT("stats: reads(%lu)\n, Free(%d)\n, cache hits(%lu, 0.%lu)," \
-	           "replacement(%lu), replaced dirty blocks(%lu)\n",
-	           dmc->reads, inval, dmc->cache_hits,
+		DMEMIT("stats: reads(%lu), writes(%lu), cache hits(%lu, 0.%lu)," \
+	           "replacement(%lu), replaced dirty blocks(%lu), considered blocks(%lu), new blocks(%lu), matched(%lu), deduplicated(%lu), redirected writes(%lu)",
+	           dmc->reads, dmc->writes, dmc->cache_hits,
 	           (dmc->reads + dmc->writes) > 0 ? \
 	           dmc->cache_hits * 100 / (dmc->reads + dmc->writes) : 0,
-	           dmc->replace, dmc->writeback);
+	           dmc->replace, dmc->writeback, dmc->considered, dmc->new_data, dmc->matches, dmc->deduped, dmc->redirects);
 		break;
 	case STATUSTYPE_TABLE:
 		DMEMIT("conf: capacity(%lluM), associativity(%u), block size(%uK), %s",
@@ -2056,10 +3083,6 @@ int __init dm_cache_init(void)
 		DMERR("cache: register failed %d", r);
 		destroy_workqueue(_kcached_wq);
 	}
-
-	f_list = init_fingerprint_list(FP_SIZE);
-	m_list = init_sector_map_list(SM_SIZE);
-	store_count = 0;
 
 	return r;
 }
