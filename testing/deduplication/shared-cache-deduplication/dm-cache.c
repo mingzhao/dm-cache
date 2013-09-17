@@ -468,6 +468,60 @@ static void io_callback(unsigned long error, void *context)
 	wake();
 }
 
+/* Minimal changes to source necessary for deduplication */
+
+static int compare_blocks(sector_t location, struct bio * bio, struct cache_c * dmc)
+{
+	struct dm_io_region where;
+	unsigned long bits;
+	int segno;
+	struct bio_vec * bvec;
+	struct page * page;
+	unsigned char * cache_data;
+    unsigned char * temp_data;
+	unsigned char * write_data;
+	int result, length;
+	result = 0;
+
+	cache_data = (unsigned char *)vmalloc((dmc->block_size * 512) + 1);
+
+	where.bdev = dmc->cache_dev->bdev;
+	where.count = dmc->block_size;
+	where.sector = location << dmc->block_shift;
+
+	dm_io_sync_vm(1, &where, READ, cache_data, &bits, dmc);
+
+	length = 0;
+
+	bio_for_each_segment(bvec, bio, segno)
+	{
+		if(segno == 0)
+		{
+			page = bio_page(bio);
+			kmap(page);
+			write_data = (unsigned char *)page_address(page);
+			kunmap(page);
+                        length += bvec->bv_len;
+		}
+		else
+		{
+			page = bio_page(bio);
+			kmap(page);
+			temp_data = strcat(write_data, (unsigned char *)page_address(page));
+			kunmap(page);
+			write_data = temp_data;
+			length += bvec->bv_len;
+		}
+	}
+
+	cache_data[dmc->block_size * 512] = '\0';
+	
+	result = memcmp(write_data, cache_data, length);
+	vfree(cache_data);
+
+	return result;	
+}
+
 /*
  * Fetch data from the source device asynchronously.
  * For a READ bio, if a cache block is larger than the requested data, then
