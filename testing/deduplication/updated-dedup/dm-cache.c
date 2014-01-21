@@ -192,6 +192,9 @@ struct cache_c {
         unsigned long invalidates;
         unsigned long inserts;
         unsigned long allocate;
+
+	unsigned long potential_stores;
+	unsigned long actual_stores;
 };
 
 /* Cache block metadata structure */
@@ -796,6 +799,7 @@ static int do_store(struct kcached_job *job)
 
 	if(DEDUP)
 	{
+		dmc->potential_stores++;
 		radix = get_block_index(job->src.sector, job->cacheblock->disk);
 		src_idx = job->src.sector;
 		disk = job->cacheblock->disk;		
@@ -827,7 +831,7 @@ static int do_store(struct kcached_job *job)
 			job->cacheblock->ref_cnt += add_ref(&job->cacheblock->refs, ref);
 			job->cacheblock->fingerprint = kmalloc(sizeof(char) * 16, GFP_KERNEL);
 			strcmp(job->cacheblock->fingerprint, fingerprint);
-			
+			dmc->actual_stores++;	
 		}
 		else
 		{
@@ -2366,6 +2370,9 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         dmc->invalidates = 0;
         dmc->inserts = 0;
 
+	dmc->potential_stores = 0;
+	dmc->actual_stores = 0;
+
 init_sc:
 	ti->split_io = dmc->block_size;
 	ti->private = &virtual_mapping[idx_mapping];
@@ -2470,10 +2477,10 @@ static void cache_dtr(struct dm_target *ti)
 		if (dmc->reads + dmc->writes > 0)
 			DMINFO("stats: reads(%lu), writes(%lu), cache hits(%lu, 0.%lu)," \
 					"replacement(%lu), replaced dirty blocks(%lu), " \
-					"flushed dirty blocks(%lu)",
+					"flushed dirty blocks(%lu), potential(%lu) actual(%lu)",
 					dmc->reads, dmc->writes, dmc->cache_hits,
 					dmc->cache_hits * 100 / (dmc->reads + dmc->writes),
-					dmc->replace, dmc->writeback, dmc->dirty);
+					dmc->replace, dmc->writeback, dmc->dirty, dmc->potential_stores, dmc->actual_stores);
 
                 vfree((void *)dmc->blocks);
                 vfree((void *)dmc->lru);
@@ -2528,23 +2535,23 @@ static int cache_status(struct dm_target *ti, status_type_t type,
 		case STATUSTYPE_INFO:
 			DMEMIT("VM-id\tstate\treads\twrites\tcache hits\tcache miss\t " \
 					"read_miss\twrite_miss\tread_hit\t " \ 
-					"inserts\tinvalidates\tlimit\tallocate\n");
+					"inserts\tinvalidates\tlimit\tallocate\tpotential\tactual\n");
 			t = cpu_clock(this_cpu);
 			//plot_data(map_dev->identifier);
 			nanosec_rem = do_div(t, 1000000000);
-			DMEMIT("%s\t%5llu\t%s\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu",
+			DMEMIT("%s\t%5llu\t%s\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu",
 					map_dev->vm_id,t, map_dev->state == ENABLED ? "ENABLED" : "DISABLED",
 					map_dev->reads, map_dev->writes, map_dev->cache_hits,
 					map_dev->misses, map_dev->read_misses, map_dev->write_misses,
 					map_dev->read_hits, map_dev->inserts, 
-					map_dev->invalidates, map_dev->limit, map_dev->allocate,map_dev->wss);
+					map_dev->invalidates, map_dev->limit, map_dev->allocate,map_dev->wss, dmc->potential_stores, dmc->actual_stores);
 			break;
 		case STATUSTYPE_TABLE:
-			DMEMIT("conf: capacity(%lluM), associativity(%u), block size(%uK), %s",
+			DMEMIT("conf: capacity(%lluM), associativity(%u), block size(%uK), %s, potential(%lu), actual(%lu)",
 					(unsigned long long) dmc->size * dmc->block_size >> 11,
 					dmc->assoc, dmc->block_size>>(10-SECTOR_SHIFT),
 					dmc->write_policy == 1 ? "write-back":
-					(dmc->write_policy == 0 ?"write-through":"write-allocate"));
+					(dmc->write_policy == 0 ?"write-through":"write-allocate"), dmc->potential_stores, dmc->actual_stores);
 			break;
 	}
 	return 0;
