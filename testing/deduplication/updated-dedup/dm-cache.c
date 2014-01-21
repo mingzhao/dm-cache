@@ -830,7 +830,7 @@ static int do_store(struct kcached_job *job)
 
 			job->cacheblock->ref_cnt += add_ref(&job->cacheblock->refs, ref);
 			job->cacheblock->fingerprint = kmalloc(sizeof(char) * 16, GFP_KERNEL);
-			strcmp(job->cacheblock->fingerprint, fingerprint);
+			strcpy(job->cacheblock->fingerprint, fingerprint);
 			dmc->actual_stores++;	
 		}
 		else
